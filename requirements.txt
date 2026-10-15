@@ -1,0 +1,14 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+sqlalchemy>=2.0.28
+pyodbc>=5.1.0
+pandas>=2.2.1
+openpyxl>=3.1.2
+pydantic>=2.6.4
+pydantic-settings>=2.2.1
+python-multipart>=0.0.9
+pytest>=8.1.1
+httpx>=0.27.0
+# Optional database drivers for supported non-SQL-Server dialects
+pymysql>=1.1.0
+psycopg2-binary>=2.9.9

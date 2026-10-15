@@ -1,0 +1,70 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checking and linting caches
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Uploaded files and generated data
+uploads/*
+!uploads/.gitkeep
+
+# Generated application data
+data/*
+!data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Temporary and scratch scripts
+scratch_*.py
+tmp/
+temp/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+# Local database and data exports
+*.db
+*.sqlite3
+*.bak
+
+# Excel and CSV files (if they contain uploaded or sensitive data)
+*.xlsx
+*.xls
+*.csv
+
