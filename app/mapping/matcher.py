@@ -715,6 +715,9 @@ class ColumnMatcher:
                         elif t_clean == "order" and entry["norm_col"] in ("price", "total amount"):
                             score, match_method, layer = 0.99, "SEMANTIC", 3
                             reason = "Invoice total monetary amount mapped to Order.Price."
+                        elif t_clean in ("settlement", "settlements") and entry["norm_col"] == "cash":
+                            score, match_method, layer = 0.99, "SEMANTIC", 3
+                            reason = "Excel invoice-level total mapped to Settlements.Cash."
                     elif norm_source == "delivery charge" and entry["table_name"] in ("Order", "Bills") and entry["norm_col"] in ("other charges", "othercharges"):
                         score, match_method, layer = 0.95, "SEMANTIC", 4
                         reason = "Delivery charge fee mapped to Order.Other_Charges."
@@ -760,9 +763,9 @@ class ColumnMatcher:
                         if t_clean == "bills" and entry["norm_col"] in ("settlement type", "settlementtype"):
                             score, match_method, layer = 0.98, "SEMANTIC", 3
                             reason = "Payment settlement mode mapped to Bills.Settlement_Type."
-                        elif t_clean == "settlements" and entry["norm_col"] in ("other settlement name", "othersettlementname"):
-                            score, match_method, layer = 0.97, "SEMANTIC", 3
-                            reason = "Payment settlement type mapped to Settlements.OtherSettlement_Name."
+                        # Intentionally do not map payment_type labels into
+                        # Settlements.OtherSettlement_Name; engine sets settlement buckets.
+
                     elif norm_source in ("customer phone", "contact phone") and entry["table_name"] == "Customer" and entry["norm_col"] == "mobile number":
                         score, match_method, layer = 0.96, "SYNONYM", 3
                         reason = "Customer contact phone explicitly mapped to Mobile_Number in Customer table."

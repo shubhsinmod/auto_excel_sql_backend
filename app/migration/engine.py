@@ -1199,6 +1199,66 @@ class MigrationEngine:
                                 is_legitimate_literal=is_legit
                             )
 
+                    # Settlement-only override: preserve the existing row grouping,
+                    # invoice/BillNo mapping, and all OrderLineItems quantity logic.
+                    # Cash receives the source invoice-level `total`; all other payment
+                    # buckets are 0 except Service_Failure and OtherSettlement (SQL NULL).
+                    if normalized_table_name.replace("_", "").replace(" ", "") in ("settlement", "settlements"): 
+                        def _norm_settlement_col(value: Any) -> str:
+                            return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+                        settlement_total_source_col = next(
+                            (c for c in df.columns if _norm_settlement_col(c) == "total"),
+                            None,
+                        )
+                        settlement_columns = {
+                            _norm_settlement_col(c.name): c for c in t_meta.columns
+                        }
+
+                        # Always include these fields in the actual INSERT column list.
+                        for normalized_name, column_meta in settlement_columns.items():
+                            if normalized_name not in {
+                                "cash", "creditcard", "sodexo", "cheque", "complementary",
+                                "others", "servicefailure", "debitcard", "ticketrestaurant",
+                                "ge", "bo", "return", "othersettlement", "othersettlementname",
+                            }:
+                                continue
+                            column_name = column_meta.name
+                            if getattr(column_meta, "identity", False):
+                                continue
+                            if column_name not in insert_cols:
+                                insert_cols.append(column_name)
+
+                            if normalized_name == "cash":
+                                raw_total = get_df_val(row, settlement_total_source_col) if settlement_total_source_col else None
+                                param_dict[column_name] = sanitize_value(
+                                    raw_total,
+                                    str(column_meta.type),
+                                    column_meta.nullable,
+                                    expects_empty_string=False,
+                                )
+                            elif normalized_name in {"servicefailure", "othersettlement", "othersettlementname"}:
+                                param_dict[column_name] = None
+                            else:
+                                param_dict[column_name] = sanitize_value(
+                                    0,
+                                    str(column_meta.type),
+                                    column_meta.nullable,
+                                    expects_empty_string=False,
+                                )
+
+                        if settlement_total_source_col is None:
+                            logger.warning(
+                                "[SETTLEMENT_CASH_TOTAL_MISSING] upload_id=%s source_row=%s; "
+                                "Excel `total` column not found, Cash will be NULL.",
+                                upload_id, source_row_num,
+                            )
+                        logger.debug(
+                            "[SETTLEMENT_CASH_TOTAL] upload_id=%s source_row=%s source_column=%s value=%r",
+                            upload_id, source_row_num, settlement_total_source_col,
+                            get_df_val(row, settlement_total_source_col) if settlement_total_source_col else None,
+                        )
+
                     # OrderLineItems quantity must come directly from the source
                     # item's item_quantity column. Do not let generic/fuzzy mapping
                     # choose item_price, item_total, or another numeric column.
