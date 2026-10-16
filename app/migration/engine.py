@@ -15,6 +15,44 @@ from app.mapping.matcher import ColumnMatcher, normalize_string, resolve_unmappe
 from app.migration.dependency import DependencyResolver
 from app.migration.id_resolver import IdResolverStore
 from app.migration.transaction import transaction_manager
+# Local invoice duplicate helpers: keep engine.py runnable even when deployed alone.
+def invoice_identity_key(value: Any) -> str:
+    """Normalize invoice values for comparison without changing stored source values."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    value_text = str(value).strip()
+    if value_text.casefold() in {"", "none", "nan", "nat", "null"}:
+        return ""
+    if value_text.endswith(".0"):
+        try:
+            value_text = str(int(float(value_text)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return value_text.casefold()
+
+def duplicate_invoice_mask(
+    frame: pd.DataFrame, invoice_column: str, existing_invoice_values: Set[str]
+) -> Tuple[pd.Series, Set[str]]:
+    """Mask source rows whose invoice already exists in Bill.BillNo."""
+    normalized_existing = {invoice_identity_key(v) for v in existing_invoice_values}
+    normalized_existing.discard("")
+    mask = frame[invoice_column].map(
+        lambda value: invoice_identity_key(value) in normalized_existing
+    )
+    skipped_keys = {
+        invoice_identity_key(value)
+        for value in frame.loc[mask, invoice_column].tolist()
+        if invoice_identity_key(value)
+    }
+    return mask, skipped_keys
+
 from app.migration.validator import MigrationValidator, is_empty_or_na
 from app.models.schema import DatabaseSchemaMetadata, TableMetadata, ColumnMetadata
 from app.models.migration import (
@@ -340,8 +378,18 @@ class MigrationEngine:
     @staticmethod
     def execute_migration(
         upload_id: str,
-        progress_callback: Optional[Callable[[str, int, int, int, int, int, int], None]] = None
+        progress_callback: Optional[Callable[[str, int, int, int, int, int, int], None]] = None,
+        duplicate_action: str = "skip",
     ) -> MigrationExecutionResponse:
+        duplicate_action = str(duplicate_action or "skip").strip().lower()
+        if duplicate_action not in {"skip", "override"}:
+            raise ValueError("duplicate_action must be 'skip' or 'override'.")
+        if duplicate_action == "override":
+            raise NotImplementedError(
+                "Override is not enabled in this build. Use duplicate_action='skip'; "
+                "no database changes have been made."
+            )
+
         # SQL Safety Guard: Ensure dry-run mode never invokes real migration execution
         if getattr(settings, "DRY_RUN_MODE", False):
             raise RuntimeError(
@@ -445,7 +493,17 @@ class MigrationEngine:
         engine_skipped_tables: Dict[str, str] = {}
         engine_table_roles: Dict[str, str] = {}
 
+        allowed_target_tables = {
+            "customer", "bill", "bills", "order", "orders",
+            "orderlineitems", "settlement", "settlements", "outlets", "itemsmaster"
+        }
         for t, m_list in table_mappings_map.items():
+            table_key = str(t).lower().replace("dbo.", "").replace("_", "").replace(" ", "").strip()
+            if table_key not in allowed_target_tables:
+                engine_table_roles[t] = TableRole.SKIP.value
+                engine_skipped_tables[t] = "Excluded by configured migration allowlist"
+                logger.info("[MIGRATION] Table '%s' excluded by allowed-table restriction.", t)
+                continue
             role, reason = classify_table_relevance(t, m_list, schema, df.columns.tolist())
             engine_table_roles[t] = role.value
             if role == TableRole.TARGET_INSERT:
@@ -643,6 +701,54 @@ class MigrationEngine:
 
         # 5. Define the execution function to be run inside the transaction
         def _execute_in_transaction(conn: Connection) -> MigrationExecutionResponse:
+            nonlocal df
+            original_source_row_count = len(df)
+            duplicate_invoice_skipped_rows = 0
+
+            # Duplicate invoices are checked against dbo.Bill.BillNo while the
+            # transaction is open. Every source row for an existing invoice is removed
+            # before any target table is processed, so Bill, Order, OrderLineItems,
+            # Settlement and dependent Customer rows are not partially inserted.
+            invoice_source_for_skip = next(
+                (c for c in df.columns if "".join(ch for ch in str(c).lower() if ch.isalnum())
+                 in {"invoiceno", "invoicenumber", "invoice"}),
+                None,
+            )
+            # Duplicate invoices are keyed by Bill.BillNo, because this project
+            # explicitly stores the Excel invoice number in BillNo using IDENTITY_INSERT.
+            bill_meta_for_skip = next(
+                (t for t in schema.tables
+                 if str(t.name).lower().replace("dbo.", "").strip() in ("bill", "bills")
+                 and any("".join(ch for ch in str(c.name).lower() if ch.isalnum()) == "billno" for c in t.columns)),
+                None,
+            )
+            if duplicate_action == "skip" and invoice_source_for_skip and bill_meta_for_skip:
+                billno_col_for_skip = next(
+                    c.name for c in bill_meta_for_skip.columns
+                    if "".join(ch for ch in str(c.name).lower() if ch.isalnum()) == "billno"
+                )
+                quoted_bill_table_for_skip = quote_identifier(bill_meta_for_skip.name, dialect_name)
+                quoted_billno_for_skip = quote_identifier(billno_col_for_skip, dialect_name)
+                lock_hint = " WITH (UPDLOCK, HOLDLOCK)" if dialect_name == "mssql" else ""
+                existing_invoice_values = conn.execute(text(
+                    f"SELECT {quoted_billno_for_skip} FROM {quoted_bill_table_for_skip}{lock_hint} "
+                    f"WHERE {quoted_billno_for_skip} IS NOT NULL"
+                )).scalars().all()
+
+                existing_invoice_keys = {invoice_identity_key(v) for v in existing_invoice_values if invoice_identity_key(v)}
+                if existing_invoice_keys:
+                    duplicate_mask, skipped_invoice_keys = duplicate_invoice_mask(
+                        df, invoice_source_for_skip, existing_invoice_keys
+                    )
+                    duplicate_invoice_skipped_rows = int(duplicate_mask.sum())
+                    if duplicate_invoice_skipped_rows:
+                        skipped_invoices = sorted(skipped_invoice_keys)
+                        logger.info(
+                            "[DUPLICATE_INVOICE_SKIP] upload_id=%s invoice_column=%s skipped_source_rows=%s duplicate_invoice_count=%s invoices_sample=%s",
+                            upload_id, invoice_source_for_skip, duplicate_invoice_skipped_rows, len(skipped_invoices), skipped_invoices[:25]
+                        )
+                        df = df.loc[~duplicate_mask].copy()
+
             id_store = IdResolverStore()
             table_stats: Dict[str, TableMigrationStat] = {t: TableMigrationStat() for t in active_tables_ordered}
             generated_ids_by_table: Dict[str, List[Any]] = {t: [] for t in active_tables_ordered}
@@ -688,35 +794,63 @@ class MigrationEngine:
                 }
                 db_to_excel = {m.database_column: m.excel_column for m in mappings}
                 target_db_cols = list(dict.fromkeys(excel_to_db.values()))
-                # User-requested behavior: preserve the Excel invoice number in
-                # Bills.BillNo, even when SQL Server marks BillNo as IDENTITY.
-                # SQL Server IDENTITY_INSERT is enabled only around each such insert
-                # and always disabled immediately afterward.
                 normalized_table_name = table_name.lower().replace("dbo.", "").strip()
-                billno_identity_col = next(
-                    (c for c in identity_cols if c.lower().replace("_", "").replace(" ", "") == "billno"),
+
+                # Invoice-number override for Bills:
+                # The user requirement is explicit: Excel invoice_no -> Bill.BillNo.
+                # If BillNo is an IDENTITY column in SQL Server, insert the supplied
+                # invoice number with IDENTITY_INSERT ON; do not let SQL Server generate
+                # sequential values such as 1, 2, 3 for this business key.
+                def _norm_invoice_column(value: Any) -> str:
+                    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+                invoice_source_col = next(
+                    (c for c in df.columns if _norm_invoice_column(c) in {
+                        "invoiceno", "invoicenumber", "invoice"
+                    }),
                     None,
                 )
-                mapped_billno_col = next(
-                    (c for c in target_db_cols if c.lower().replace("_", "").replace(" ", "") == "billno"),
+                billno_schema_col = next(
+                    (c for c in col_meta_map if _norm_invoice_column(c) == "billno"),
                     None,
                 )
-                bills_billno_identity_insert = (
-                    dialect_name == "mssql"
-                    and normalized_table_name in ("bill", "bills")
-                    and billno_identity_col is not None
-                    and mapped_billno_col is not None
+                billnumber_schema_col = next(
+                    (c for c in col_meta_map if _norm_invoice_column(c) == "billnumber"),
+                    None,
                 )
-                if bills_billno_identity_insert:
-                    identity_cols = [
-                        c for c in identity_cols
-                        if c.lower().replace("_", "").replace(" ", "") != "billno"
-                    ]
+
+                bills_billno_identity_insert = False
+                mapped_billno_col = None
+                if normalized_table_name in ("bill", "bills") and invoice_source_col and billno_schema_col:
+                    # The user's schema/business rule requires the SAME Excel invoice
+                    # number in BOTH Bill.BillNo and Bill.Bill_Number. BillNo may be an
+                    # IDENTITY column, so explicitly insert its value with IDENTITY_INSERT.
+                    # Keep Bill_Number as a separate mapped column; do not replace either
+                    # column with a generated/sequential value.
+                    excel_to_db.pop(invoice_source_col, None)
+                    excel_to_db[invoice_source_col] = billno_schema_col
+                    db_to_excel = {db_col: ex_col for ex_col, db_col in excel_to_db.items()}
+                    target_db_cols = list(dict.fromkeys(excel_to_db.values()))
+                    mapped_billno_col = billno_schema_col
+
+                    if billnumber_schema_col:
+                        if billnumber_schema_col not in target_db_cols:
+                            target_db_cols.append(billnumber_schema_col)
+                        db_to_excel[billnumber_schema_col] = invoice_source_col
+
+                    billno_is_identity = bool(getattr(col_meta_map[billno_schema_col], "identity", False))
+                    bills_billno_identity_insert = dialect_name == "mssql" and billno_is_identity
+                    if billno_is_identity:
+                        # It must be included in the INSERT despite being an IDENTITY column.
+                        identity_cols = [
+                            c for c in identity_cols
+                            if _norm_invoice_column(c) != "billno"
+                        ]
                     logger.info(
-                        "[BILL_INVOICE_MAPPING] table=%s source_column=%s target_column=%s identity_insert=True",
-                        table_name,
-                        excel_to_db.get(mapped_billno_col),
-                        mapped_billno_col,
+                        "[BILL_INVOICE_MAPPING] table=%s source_column=%s target_columns=%s identity_insert=%s",
+                        table_name, invoice_source_col,
+                        [c for c in (billno_schema_col, billnumber_schema_col) if c],
+                        bills_billno_identity_insert
                     )
 
                 # Business-key columns used to index IDs for foreign-key resolution only.
@@ -899,7 +1033,7 @@ class MigrationEngine:
                                 upload_id, unique_order_invoices, duplicate_order_rows
                             )
 
-                elif normalized_table_name == "bills":
+                elif normalized_table_name in ("bill", "bills"):
                     billno_excel_col = next(
                         (m.excel_column for m in mappings
                          if normalize_string(m.database_column).replace(" ", "").replace("_", "") in ("billno", "billnumber")
@@ -1065,22 +1199,22 @@ class MigrationEngine:
                                 is_legitimate_literal=is_legit
                             )
 
-                    # Minimal mapping addition: copy the value already assigned to Bills.BillNo
-                    # into Bills.Bill_Number as well. Leave all other mapping and migration logic unchanged.
-                    if normalized_table_name in ("bill", "bills"):
-                        billno_col = next((c for c in col_meta_map if c.lower() == "billno"), None)
-                        bill_number_col = next((c for c in col_meta_map if c.lower().replace("_", "") == "billnumber"), None)
-                        if billno_col and bill_number_col and billno_col in param_dict:
-                            if bill_number_col not in insert_cols:
-                                insert_cols.append(bill_number_col)
-                            bill_number_meta = col_meta_map[bill_number_col]
-                            param_dict[bill_number_col] = sanitize_value(
-                                param_dict[billno_col],
-                                bill_number_meta.type,
-                                bill_number_meta.nullable,
-                                expects_empty_string=should_column_receive_empty_string(
-                                    bill_number_col, table_name, bill_number_meta, t_meta, table_fk_cols
-                                ),
+                    # Force the Excel invoice number into BOTH Bill.BillNo and
+                    # Bill.Bill_Number. BillNo is the authoritative parent key for FKs.
+                    if normalized_table_name in ("bill", "bills") and invoice_source_col and mapped_billno_col:
+                        invoice_raw_value = get_df_val(row, invoice_source_col)
+                        invoice_target_cols = [mapped_billno_col]
+                        if billnumber_schema_col:
+                            invoice_target_cols.append(billnumber_schema_col)
+                        for invoice_target_col in dict.fromkeys(invoice_target_cols):
+                            if invoice_target_col not in insert_cols:
+                                insert_cols.append(invoice_target_col)
+                            invoice_col_meta = col_meta_map[invoice_target_col]
+                            param_dict[invoice_target_col] = sanitize_value(
+                                invoice_raw_value,
+                                str(invoice_col_meta.type),
+                                invoice_col_meta.nullable,
+                                expects_empty_string=False,
                             )
 
                     # Populate unmapped/missing optional text columns with empty strings.
@@ -1406,6 +1540,36 @@ class MigrationEngine:
                             elif c_meta and c_meta.nullable:
                                 param_dict[fk_col] = None
 
+                    # Bills: BillNo stores the Excel invoice number. If that invoice
+                    # already exists, reuse its existing BillNo for child FK resolution.
+                    if (
+                        normalized_table_name in ("bill", "bills")
+                        and bills_billno_identity_insert
+                        and mapped_billno_col in param_dict
+                        and param_dict.get(mapped_billno_col) is not None
+                    ):
+                        invoice_value = param_dict[mapped_billno_col]
+                        existing_bill_sql = text(
+                            f"SELECT {quote_identifier(mapped_billno_col, dialect_name)} "
+                            f"FROM {quoted_tbl} "
+                            f"WHERE {quote_identifier(mapped_billno_col, dialect_name)} = :invoice_value"
+                        )
+                        existing_bill_id = conn.execute(
+                            existing_bill_sql, {"invoice_value": invoice_value}
+                        ).scalar()
+                        if existing_bill_id is not None:
+                            id_store.register_id(table_name, str(invoice_value).strip(), existing_bill_id)
+                            id_store.register_id(table_name, normalize_string(str(invoice_value)), existing_bill_id)
+                            id_store.register_row_id(table_name, int(row_idx), existing_bill_id)
+                            id_store.register_composite_key(table_name, row_key_tuple, existing_bill_id)
+                            generated_ids_by_table[table_name].append(existing_bill_id)
+                            t_stat.reused += 1
+                            logger.info(
+                                "[BILLS_INVOICE_REUSED] upload_id=%s row=%s invoice=%r existing_BillNo=%r; skipped duplicate insert",
+                                upload_id, source_row_num, invoice_value, existing_bill_id
+                            )
+                            continue
+
                     # Build parameterized SQL
                     row_insert_cols = []
                     for c in insert_cols:
@@ -1590,6 +1754,16 @@ class MigrationEngine:
                                         id_store.register_id(table_name, src_val, new_id)
                                         id_store.register_id(table_name, normalize_string(src_val), new_id)
 
+                            # Register Bill_Number (Excel invoice_no) as a business key
+                            # pointing to the generated internal BillNo primary key.
+                            if normalized_table_name in ("bill", "bills") and invoice_source_col:
+                                invoice_key_value = get_df_val(row, invoice_source_col)
+                                if not is_empty_or_na(invoice_key_value):
+                                    invoice_key_text = str(invoice_key_value).strip()
+                                    id_store.register_id(table_name, invoice_key_text, new_id)
+                                    id_store.register_id(table_name, normalize_string(invoice_key_text), new_id)
+                                    id_store.register_id(table_name, invoice_key_text.casefold(), new_id)
+
                             # Register the inserted source row. All rows with the same
                             # invoice map to the single Order_ID generated for the invoice,
                             # allowing every OrderLineItems row to resolve its parent.
@@ -1702,14 +1876,14 @@ class MigrationEngine:
                 verified_inserted_counts[table_name] = verified_cnt
                 verification_details[table_name] = verif_text
 
-            total_src_rows = len(df_records)
+            total_src_rows = original_source_row_count
             src_with_ins = len(source_row_indices_with_insert)
             src_fully_reused = max(0, total_src_rows - src_with_ins)
             total_table_ops = sum(s.inserted + s.reused + s.updated for s in table_stats.values())
             total_ins = sum(s.inserted for s in table_stats.values())
             total_reus = sum(s.reused for s in table_stats.values())
             total_upd = sum(s.updated for s in table_stats.values())
-            total_skip = sum(s.skipped for s in table_stats.values())
+            total_skip = sum(s.skipped for s in table_stats.values()) + duplicate_invoice_skipped_rows
             total_time = round(time.time() - t_start, 3)
 
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1749,7 +1923,11 @@ class MigrationEngine:
                 failureDetails=failure_details,
                 verificationCounts=verif_counts,
                 processingTimeSeconds=total_time,
-                message="Database migration transaction completed and committed successfully."
+                message=(
+                    f"Database migration transaction completed. Skipped {duplicate_invoice_skipped_rows} source row(s) belonging to invoice number(s) already present in Bill.BillNo; existing invoice data was left unchanged."
+                    if duplicate_invoice_skipped_rows else
+                    "Database migration transaction completed and committed successfully. No duplicate BillNo invoices were found."
+                )
             )
 
         # 6. Run atomic transaction using TransactionManager
