@@ -1199,6 +1199,40 @@ class MigrationEngine:
                                 is_legitimate_literal=is_legit
                             )
 
+                    # OrderLineItems quantity must come directly from the source
+                    # item's item_quantity column. Do not let generic/fuzzy mapping
+                    # choose item_price, item_total, or another numeric column.
+                    if normalized_table_name.replace("_", "").replace(" ", "") == "orderlineitems":
+                        def _norm_quantity_name(value: Any) -> str:
+                            return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+                        source_item_quantity_col = next(
+                            (c for c in df.columns if _norm_quantity_name(c) == "itemquantity"),
+                            None,
+                        )
+                        target_quantity_col = next(
+                            (c for c in col_meta_map if _norm_quantity_name(c) == "quantity"),
+                            None,
+                        )
+                        if source_item_quantity_col and target_quantity_col:
+                            raw_item_quantity = get_df_val(row, source_item_quantity_col)
+                            quantity_meta = col_meta_map[target_quantity_col]
+                            param_dict[target_quantity_col] = sanitize_value(
+                                raw_item_quantity,
+                                str(quantity_meta.type),
+                                quantity_meta.nullable,
+                                expects_empty_string=False,
+                            )
+                            if target_quantity_col not in insert_cols:
+                                insert_cols.append(target_quantity_col)
+                            logger.debug(
+                                "[ORDER_LINE_QUANTITY_MAPPING] upload_id=%s source_row=%s "
+                                "source_column=%s source_value=%r target_column=%s final_value=%r",
+                                upload_id, source_row_num, source_item_quantity_col,
+                                raw_item_quantity, target_quantity_col,
+                                param_dict[target_quantity_col],
+                            )
+
                     # Force the Excel invoice number into BOTH Bill.BillNo and
                     # Bill.Bill_Number. BillNo is the authoritative parent key for FKs.
                     if normalized_table_name in ("bill", "bills") and invoice_source_col and mapped_billno_col:
