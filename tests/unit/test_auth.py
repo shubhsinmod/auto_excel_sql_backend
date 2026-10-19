@@ -44,8 +44,9 @@ class FakeConnection:
 
 
 class FakeEngine:
-    def __init__(self, rows):
+    def __init__(self, rows, name: str = "mssql"):
         self.connection = FakeConnection(rows)
+        self.name = name
 
     def connect(self):
         return self.connection
@@ -109,3 +110,19 @@ def test_login_rejects_duplicate_username_matches(monkeypatch):
         login(LoginRequest(username="operator", password="secret"))
 
     assert error.value.status_code == 401
+
+
+def test_login_supports_postgresql_dialect_with_limit(monkeypatch):
+    password_hash = hashlib.sha1(b"secret").hexdigest()
+    # In PostgreSQL, columns and tables might be lowercase
+    engine = FakeEngine([{"username": "operator", "password": password_hash}], name="postgresql")
+    monkeypatch.setattr(auth, "get_engine", lambda: engine)
+
+    result = login(LoginRequest(username=" operator ", password="secret"))
+
+    assert result.authenticated is True
+    assert result.username == "operator"
+    assert engine.connection.parameters == {"username": "operator"}
+    assert "LIMIT 2" in engine.connection.query
+    assert "TOP" not in engine.connection.query
+    assert "[dbo]" not in engine.connection.query
