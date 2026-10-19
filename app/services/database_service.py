@@ -15,6 +15,7 @@ class DatabaseService:
     def test_connection(request=None) -> ConnectionTestResponse:
         """Test either the configured connection or an explicitly supplied connection."""
         if request is not None:
+            req_db_type = getattr(request, "db_type", None) or settings.DB_TYPE
             data = db_manager.test_connection(
                 server=getattr(request, "server", None) or getattr(request, "db_host", None) or settings.DB_HOST,
                 database=getattr(request, "database", None) or getattr(request, "db_name", None) or settings.DB_NAME,
@@ -25,10 +26,11 @@ class DatabaseService:
                 trusted_connection=(getattr(request, "trusted_connection", None)
                                     if getattr(request, "trusted_connection", None) is not None
                                     else settings.DB_TRUSTED_CONNECTION),
+                db_type=req_db_type,
             )
             return ConnectionTestResponse(
                 connected=data["connected"], database=data.get("database", ""),
-                db_type="mssql", server=data.get("server"), version=data.get("version"),
+                db_type=data.get("db_type") or req_db_type, server=data.get("server"), version=data.get("version"),
                 message=data.get("message", ""), error=data.get("error")
             )
 
