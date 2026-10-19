@@ -317,6 +317,12 @@ class MigrationService:
             if res.transaction == "COMMITTED" or res.status == "BLOCKED":
                 with self._lock:
                     self._migration_cache[upload_id] = res
+            if res.transaction == "COMMITTED":
+                try:
+                    excel_service.mark_import_success(upload_id)
+                except Exception as history_error:
+                    # A ledger failure must not reverse or misreport a committed SQL transaction.
+                    logger.error(f"[IMPORT HISTORY] Could not register committed upload {upload_id}: {history_error}")
             return res
 
         job_manager.run_in_background(upload_id, _worker)
@@ -412,6 +418,10 @@ class MigrationService:
             if response.transaction == "COMMITTED":
                 with self._lock:
                     self._migration_cache[upload_id] = response
+                try:
+                    excel_service.mark_import_success(upload_id)
+                except Exception as history_error:
+                    logger.error(f"[IMPORT HISTORY] Could not register committed upload {upload_id}: {history_error}")
                 job_manager.mark_completed(upload_id, response)
             elif response.status == "BLOCKED":
                 with self._lock:
