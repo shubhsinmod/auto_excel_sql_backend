@@ -3,6 +3,9 @@ import uuid
 import json
 import time
 import shutil
+import hashlib
+import sqlite3
+import threading
 from typing import Dict, Any, Optional
 from fastapi import UploadFile
 
@@ -12,6 +15,29 @@ from app.core.logging import logger
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Small local ledger: only successful imports are registered, so failed imports
+# remain retryable. This is independent of the business-table mapping logic.
+IMPORT_HISTORY_DB = os.path.join(os.path.dirname(UPLOAD_DIR), "data", "import_history.sqlite3")
+os.makedirs(os.path.dirname(IMPORT_HISTORY_DB), exist_ok=True)
+_IMPORT_HISTORY_LOCK = threading.Lock()
+
+
+def _initialize_import_history() -> None:
+    with sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS successful_file_imports (
+                file_sha256 TEXT PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                upload_id TEXT NOT NULL,
+                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+_initialize_import_history()
 
 
 class ExcelService:
@@ -54,6 +80,21 @@ class ExcelService:
         t_save_1 = time.time()
         logger.info(f"[STEP3] Excel file save END | {t_save_1 - t_save_0:.3f}s")
 
+        # 3.5 Exact-file duplicate check before workbook analysis or DB work.
+        # The SHA-256 digest is content-based, so renaming the same file does not bypass it.
+        file_sha256 = ExcelService._sha256_file(target_file_path)
+        existing_import = ExcelService.find_successful_import(file_sha256)
+        if existing_import:
+            try:
+                os.remove(target_file_path)
+            except OSError:
+                pass
+            raise ValueError(
+                "DUPLICATE_FILE: This exact file was already imported successfully "
+                f"as '{existing_import['original_filename']}' on {existing_import['imported_at']}. "
+                "Upload was stopped; no database records were changed."
+            )
+
         # 4. Validate saved Excel workbook
         is_valid_wb, wb_error = validate_excel_workbook(target_file_path)
         if not is_valid_wb:
@@ -82,7 +123,8 @@ class ExcelService:
         session_file_path = os.path.join(UPLOAD_DIR, f"{upload_id}_session.json")
         session_payload = {
             **analysis_data,
-            "filePath": target_file_path
+            "filePath": target_file_path,
+            "fileSha256": file_sha256
         }
         with open(session_file_path, "w", encoding="utf-8") as f:
             json.dump(session_payload, f, indent=2)
@@ -91,6 +133,44 @@ class ExcelService:
         logger.info(f"[STEP3] Upload & Analysis COMPLETE | TOTAL={t_end - t_start:.3f}s")
 
         return analysis_data
+
+    @staticmethod
+    def _sha256_file(file_path: str) -> str:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def find_successful_import(file_sha256: str) -> Optional[Dict[str, Any]]:
+        with _IMPORT_HISTORY_LOCK, sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT original_filename, upload_id, imported_at "
+                "FROM successful_file_imports WHERE file_sha256 = ?",
+                (file_sha256,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def mark_import_success(upload_id: str) -> None:
+        """Record the content hash only after the SQL transaction commits."""
+        session = ExcelService.get_upload_session(upload_id)
+        if not session:
+            logger.warning(f"Cannot register successful import: session {upload_id} not found")
+            return
+        file_sha256 = session.get("fileSha256")
+        if not file_sha256:
+            logger.warning(f"Cannot register successful import: file hash missing for {upload_id}")
+            return
+        with _IMPORT_HISTORY_LOCK, sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO successful_file_imports "
+                "(file_sha256, original_filename, upload_id) VALUES (?, ?, ?)",
+                (file_sha256, session.get("fileName") or "uploaded_file", upload_id),
+            )
+            conn.commit()
 
     @staticmethod
     def get_upload_session(upload_id: str) -> Optional[Dict[str, Any]]:

@@ -22,10 +22,11 @@ async def upload_excel(file: UploadFile = File(...)):
         analysis_result = excel_service.save_and_analyze_excel(file)
         return analysis_result
     except ValueError as val_err:
-        logger.warning(f"Excel validation error for file '{file.filename}': {str(val_err)}")
+        message = str(val_err)
+        logger.warning(f"Excel validation error for file '{file.filename}': {message}")
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(val_err)
+            status_code=status.HTTP_409_CONFLICT if message.startswith("DUPLICATE_FILE:") else status.HTTP_400_BAD_REQUEST,
+            detail=message.removeprefix("DUPLICATE_FILE: ")
         )
     except Exception as e:
         logger.error(f"Unexpected error uploading Excel file '{file.filename}': {str(e)}")
