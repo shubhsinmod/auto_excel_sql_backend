@@ -198,6 +198,7 @@ def _extract_inspector_metadata(engine: Engine) -> DatabaseSchemaMetadata:
 
     table_names = inspector.get_table_names()
     tables_metadata: List[TableMetadata] = []
+    default_schema = "public" if db_type in ("postgresql", "postgres") else ("dbo" if db_type == "mssql" else "public")
 
     for table_name in table_names:
         pk_constraint = inspector.get_pk_constraint(table_name)
@@ -209,7 +210,7 @@ def _extract_inspector_metadata(engine: Engine) -> DatabaseSchemaMetadata:
             referred_table = fk.get("referred_table")
             constrained_cols = fk.get("constrained_columns", [])
             referred_cols = fk.get("referred_columns", [])
-            referred_schema = fk.get("referred_schema") or "dbo"
+            referred_schema = fk.get("referred_schema") or default_schema
 
             for col, ref_col in zip(constrained_cols, referred_cols):
                 fk_info = ForeignKeyInfo(
@@ -254,7 +255,7 @@ def _extract_inspector_metadata(engine: Engine) -> DatabaseSchemaMetadata:
 
         table_meta = TableMetadata(
             name=table_name,
-            schema_name="dbo",
+            schema_name=default_schema,
             columns=columns_metadata,
             primary_keys=list(primary_key_cols),
             foreign_keys=foreign_keys_list

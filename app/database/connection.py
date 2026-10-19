@@ -353,43 +353,71 @@ def test_db_connection(custom_settings=None) -> tuple[bool, str]:
 
 
 class DatabaseManager:
-    """Compatibility facade for API/tests that need ad-hoc SQL Server connections.
+    """Compatibility facade for API/tests that need ad-hoc database connections.
 
-    This does not change the application's configured global engine. Credentials are
+    Supports MSSQL, PostgreSQL, MySQL, and SQLite. Credentials are
     never included in returned error messages.
     """
     @staticmethod
-    def create_custom_engine(server: str, database: str, username: str = "", password: str = "",
-                             port: int | None = None, driver: str = "ODBC Driver 17 for SQL Server",
-                             trusted_connection: bool = False) -> Engine:
+    def create_custom_engine(server: str = "localhost", database: str = "", username: str = "",
+                             password: str = "", port: int | None = None,
+                             driver: str = "ODBC Driver 17 for SQL Server",
+                             trusted_connection: bool = False, db_type: str = "mssql") -> Engine:
         from urllib.parse import quote_plus
         from sqlalchemy.engine import URL
-        query = {"driver": driver}
-        if trusted_connection:
-            query["trusted_connection"] = "yes"
+
+        db_type_lower = (db_type or "mssql").lower()
+        password_encoded = quote_plus(password) if password else ""
+        clean_db = (database or "").strip("[]")
+
+        if db_type_lower in ("postgres", "postgresql"):
+            p = port or 5432
+            auth = f"{username}:{password_encoded}@" if (username and password_encoded) else (f"{username}@" if username else "")
+            return create_engine(f"postgresql+psycopg2://{auth}{server}:{p}/{clean_db}", pool_pre_ping=True)
+
+        elif db_type_lower in ("mysql", "mariadb"):
+            p = port or 3306
+            auth = f"{username}:{password_encoded}@" if (username and password_encoded) else (f"{username}@" if username else "")
+            return create_engine(f"mysql+pymysql://{auth}{server}:{p}/{clean_db}?charset=utf8mb4", pool_pre_ping=True)
+
+        elif db_type_lower == "sqlite":
+            return create_engine(f"sqlite:///{clean_db}", pool_pre_ping=True)
+
+        else:
+            query = {"driver": driver}
+            if trusted_connection:
+                query["trusted_connection"] = "yes"
+                return create_engine(URL.create(
+                    "mssql+pyodbc", host=server, port=port, database=clean_db, query=query
+                ), pool_pre_ping=True)
             return create_engine(URL.create(
-                "mssql+pyodbc", host=server, port=port, database=database, query=query
+                "mssql+pyodbc", username=username, password=password, host=server,
+                port=port, database=clean_db, query=query
             ), pool_pre_ping=True)
-        return create_engine(URL.create(
-            "mssql+pyodbc", username=username, password=password, host=server,
-            port=port, database=database, query=query
-        ), pool_pre_ping=True)
 
     @classmethod
-    def test_connection(cls, server: str, database: str, username: str = "", password: str = "",
-                        port: int | None = None, driver: str = "ODBC Driver 17 for SQL Server",
-                        trusted_connection: bool = False) -> dict:
+    def test_connection(cls, server: str = "localhost", database: str = "", username: str = "",
+                        password: str = "", port: int | None = None,
+                        driver: str = "ODBC Driver 17 for SQL Server",
+                        trusted_connection: bool = False, db_type: str = "mssql") -> dict:
         engine = None
+        db_type_lower = (db_type or "mssql").lower()
         try:
-            engine = db_manager.create_custom_engine(server, database, username, password, port, driver, trusted_connection)
+            engine = cls.create_custom_engine(
+                server=server, database=database, username=username, password=password,
+                port=port, driver=driver, trusted_connection=trusted_connection, db_type=db_type
+            )
             with engine.connect() as conn:
-                version = conn.execute(text("SELECT @@VERSION")).scalar()
+                version_sql = text("SELECT version()") if db_type_lower in ("postgres", "postgresql", "mysql") else text("SELECT @@VERSION")
+                version = conn.execute(version_sql).scalar()
             return {"connected": True, "database": database, "server": server,
-                    "version": str(version or ""), "message": "Connected successfully", "error": None}
+                    "version": str(version or ""), "message": "Connected successfully", "error": None,
+                    "db_type": db_type_lower}
         except Exception as exc:
             message = str(exc).replace(password, "[REDACTED]") if password else str(exc)
             return {"connected": False, "database": database, "server": server,
-                    "version": None, "message": "Connection failed", "error": message}
+                    "version": None, "message": "Connection failed", "error": message,
+                    "db_type": db_type_lower}
         finally:
             if engine is not None:
                 engine.dispose()
