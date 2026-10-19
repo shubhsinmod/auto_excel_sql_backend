@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     DB_PASSWORD: Optional[str] = Field(default="")
     DB_DRIVER: str = Field(default="ODBC Driver 17 for SQL Server")
     DB_TRUSTED_CONNECTION: bool = Field(default=False)
+    DATABASE_URL: Optional[str] = Field(default=None, description="Full connection string override if provided directly.")
 
     # Application Configuration
     APP_ENV: str = Field(default="development")
@@ -113,8 +114,26 @@ class Settings(BaseSettings):
     @property
     def database_url(self) -> str:
         """
-        Dynamically constructs the SQLAlchemy database URL based on DB_TYPE.
+        Dynamically constructs the SQLAlchemy database URL based on DB_TYPE,
+        or returns DATABASE_URL if explicitly provided.
         """
+        if self.DATABASE_URL:
+            raw_url = self.DATABASE_URL.strip()
+            # Normalize postgres:// to postgresql+psycopg:// or postgresql+psycopg2://
+            if raw_url.startswith("postgres://"):
+                try:
+                    import psycopg
+                    return raw_url.replace("postgres://", "postgresql+psycopg://", 1)
+                except ImportError:
+                    return raw_url.replace("postgres://", "postgresql+psycopg2://", 1)
+            elif raw_url.startswith("postgresql://") and not raw_url.startswith("postgresql+"):
+                try:
+                    import psycopg
+                    return raw_url.replace("postgresql://", "postgresql+psycopg://", 1)
+                except ImportError:
+                    return raw_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+            return raw_url
+
         db_type = self.DB_TYPE.lower()
         clean_db_name = self.DB_NAME.strip("[]") if self.DB_NAME else ""
         password_encoded = urllib.parse.quote_plus(self.DB_PASSWORD) if self.DB_PASSWORD else ""
@@ -139,7 +158,13 @@ class Settings(BaseSettings):
 
         elif db_type in ("postgres", "postgresql"):
             port = self.DB_PORT if self.DB_PORT else 5432
-            return f"postgresql://{user}:{password_encoded}@{self.DB_HOST}:{port}/{self.DB_NAME}"
+            auth = f"{user}:{password_encoded}@" if (user and password_encoded) else (f"{user}@" if user else "")
+            try:
+                import psycopg
+                driver = "postgresql+psycopg"
+            except ImportError:
+                driver = "postgresql+psycopg2"
+            return f"{driver}://{auth}{self.DB_HOST}:{port}/{clean_db_name}"
 
         elif db_type == "sqlite":
             return f"sqlite:///{self.DB_NAME}"
