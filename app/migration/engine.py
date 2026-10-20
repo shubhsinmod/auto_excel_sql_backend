@@ -812,10 +812,15 @@ class MigrationEngine:
                                 for k in (invoice_identity_key(b_num), invoice_identity_key(b_no), str(b_num or "").strip(), str(b_no or "").strip()):
                                     if k:
                                         existing_db_bills[k] = bill_info
+                                        if b_no is not None:
+                                            id_store.register_id("Bills", k, b_no)
+                                            id_store.register_id("Bills", normalize_string(k), b_no)
                                 if o_id is not None:
                                     for k in (str(b_no or "").strip(), invoice_identity_key(b_no), str(b_num or "").strip(), invoice_identity_key(b_num)):
                                         if k:
                                             existing_db_orders_by_billno[k] = o_id
+                                            id_store.register_id("Order", k, o_id)
+                                            id_store.register_id("Order", normalize_string(k), o_id)
                                             if str(k).isdigit():
                                                 try:
                                                     existing_db_orders_by_billno[int(k)] = o_id
@@ -851,6 +856,8 @@ class MigrationEngine:
                                                 r_bno_str = str(r_bno).strip()
                                                 existing_db_orders_by_billno[r_bno_str] = r_oid
                                                 existing_db_orders_by_billno[invoice_identity_key(r_bno)] = r_oid
+                                                id_store.register_id("Order", r_bno_str, r_oid)
+                                                id_store.register_id("Order", invoice_identity_key(r_bno), r_oid)
                                                 if r_bno_str.isdigit():
                                                     try:
                                                         existing_db_orders_by_billno[int(r_bno_str)] = r_oid
@@ -858,6 +865,22 @@ class MigrationEngine:
                                                         pass
                                     except Exception as ord_err:
                                         logger.warning(f"[ORDER_PREFETCH] Bulk order lookup warning: {ord_err}")
+
+                        # Also cross-link Order by Bill_Number so any format finds it in memory
+                        for b_inf in existing_db_bills.values():
+                            b_no_v = b_inf.get("BillNo")
+                            b_num_v = b_inf.get("Bill_Number")
+                            if b_no_v is not None:
+                                o_id_m = (
+                                    existing_db_orders_by_billno.get(str(b_no_v).strip())
+                                    or existing_db_orders_by_billno.get(invoice_identity_key(b_no_v))
+                                )
+                                if o_id_m is not None and b_num_v:
+                                    b_num_s = str(b_num_v).strip()
+                                    existing_db_orders_by_billno[b_num_s] = o_id_m
+                                    existing_db_orders_by_billno[invoice_identity_key(b_num_v)] = o_id_m
+                                    id_store.register_id("Order", b_num_s, o_id_m)
+                                    id_store.register_id("Order", invoice_identity_key(b_num_v), o_id_m)
 
                 logger.info(
                     "[INVOICE_PREFETCH] Completed in-memory check: found %d existing bills out of %d Excel invoices (duplicate_action=%s)",
@@ -1041,7 +1064,7 @@ class MigrationEngine:
                 if normalized_table_name in ("settlements", "settlement") and "BillNo" in col_meta_map and "BillNo" not in select_cols:
                     select_cols.append("BillNo")
 
-                if select_cols and (normalized_table_name in referenced_parent_names or is_transaction_header or has_unique_identifying):
+                if select_cols and not is_transaction_header and (normalized_table_name in referenced_parent_names or has_unique_identifying):
                     quoted_select_cols = [quote_identifier(c, dialect_name) for c in select_cols]
                     try:
                         select_sql = f"SELECT {', '.join(quoted_select_cols)} FROM {quoted_tbl}"
@@ -1270,6 +1293,54 @@ class MigrationEngine:
                 is_leaf_table = (normalized_table_name not in referenced_parent_names) and not bills_billno_identity_insert
                 leaf_rows_by_cols: Dict[Tuple[str, ...], List[Tuple[Dict[str, Any], int]]] = {}
 
+                # Table-level batch update collectors
+                table_updates_list: List[Dict[str, Any]] = []
+                table_update_cols: List[str] = []
+                table_update_pk_col: Optional[str] = None
+
+                # Table-level IDENTITY_INSERT for MSSQL (avoids per-row toggling roundtrips)
+                table_identity_insert_active = False
+                if dialect_name == "mssql" and bills_billno_identity_insert:
+                    try:
+                        conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} ON"))
+                        table_identity_insert_active = True
+                        logger.info(f"[PERF] Enabled SET IDENTITY_INSERT {quoted_tbl} ON at table start")
+                    except Exception as e:
+                        logger.warning(f"Could not enable IDENTITY_INSERT for {table_name}: {e}")
+
+                # High-performance bulk delete of previous items/settlements for overridden records
+                if duplicate_action == "override":
+                    norm_curr = normalized_table_name.replace("_", "").replace(" ", "")
+                    if norm_curr == "orderlineitems":
+                        oids_to_clear = [oid for oid in set(existing_db_orders_by_billno.values()) if oid is not None and oid not in cleared_order_ids]
+                        if oids_to_clear:
+                            quoted_oid_col = quote_identifier("Order_ID", dialect_name)
+                            CHUNK = 1000
+                            for c_start in range(0, len(oids_to_clear), CHUNK):
+                                chunk_del = oids_to_clear[c_start:c_start + CHUNK]
+                                params_del = {f"oid_{idx}": _to_native_py(v) for idx, v in enumerate(chunk_del)}
+                                placeholders = ", ".join(f":oid_{idx}" for idx in range(len(chunk_del)))
+                                try:
+                                    conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_oid_col} IN ({placeholders})"), params_del)
+                                except Exception as del_err:
+                                    logger.warning("[MIGRATION_PERF] Bulk delete OrderLineItems chunk warning: %s", del_err)
+                            cleared_order_ids.update(oids_to_clear)
+
+                    elif norm_curr in ("settlement", "settlements"):
+                        bnos_to_clear = [b["BillNo"] for b in existing_db_bills.values() if b.get("BillNo") is not None and b.get("BillNo") not in cleared_settlement_bill_nos]
+                        if bnos_to_clear:
+                            quoted_bno_col = quote_identifier("BillNo", dialect_name)
+                            CHUNK = 1000
+                            for c_start in range(0, len(bnos_to_clear), CHUNK):
+                                chunk_del = bnos_to_clear[c_start:c_start + CHUNK]
+                                params_del = {f"bno_{idx}": _to_native_py(v) for idx, v in enumerate(chunk_del)}
+                                placeholders = ", ".join(f":bno_{idx}" for idx in range(len(chunk_del)))
+                                try:
+                                    conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_bno_col} IN ({placeholders})"), params_del)
+                                except Exception as del_err:
+                                    logger.warning("[MIGRATION_PERF] Bulk delete Settlements chunk warning: %s", del_err)
+                            cleared_settlement_bill_nos.update(bnos_to_clear)
+
 
 
                 # 5.3 Iterate rows and execute parameterized INSERTs
@@ -1420,9 +1491,20 @@ class MigrationEngine:
                                     invoice_target_cols.append(_c)
 
                         for invoice_target_col in dict.fromkeys(invoice_target_cols):
+                            if invoice_target_col in identity_cols and not bills_billno_identity_insert:
+                                continue
+                            invoice_col_meta = col_meta_map[invoice_target_col]
+                            # If column is integer but invoice string is non-numeric, do not insert non-numeric string into INT PK
+                            c_type_upper = str(invoice_col_meta.type).upper()
+                            is_int_col = any(it in c_type_upper for it in ("INT", "BIGINT", "SMALLINT", "TINYINT"))
+                            if is_int_col:
+                                try:
+                                    int(float(str(invoice_raw_value).strip()))
+                                except Exception:
+                                    continue
+
                             if invoice_target_col not in insert_cols:
                                 insert_cols.append(invoice_target_col)
-                            invoice_col_meta = col_meta_map[invoice_target_col]
                             param_dict[invoice_target_col] = sanitize_value(
                                 invoice_raw_value,
                                 str(invoice_col_meta.type),
@@ -1879,6 +1961,21 @@ class MigrationEngine:
                                         quoted_oid_col = quote_identifier("Order_ID", dialect_name)
                                         conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_oid_col} = :oid"), {"oid": oid_for_line})
                                         cleared_order_ids.add(oid_for_line)
+                        elif normalized_table_name.replace("_", "").replace(" ", "") in ("settlement", "settlements"):
+                            settle_inv = get_df_val(row, settlement_invoice_col) if settlement_invoice_col else (get_df_val(row, invoice_source_col) if invoice_source_col else None)
+                            settle_key = invoice_identity_key(settle_inv) if settle_inv is not None else ""
+                            if settle_key and settle_key in existing_db_bills:
+                                if duplicate_action == "skip":
+                                    t_stat.skipped += 1
+                                    continue
+                                elif duplicate_action == "override":
+                                    b_no_for_settle = param_dict.get("BillNo")
+                                    if b_no_for_settle is None and settle_key:
+                                        b_no_for_settle = id_store.get_id("Bills", settle_key) or id_store.get_id("Bills", normalize_string(str(settle_key)))
+                                    if b_no_for_settle is not None and b_no_for_settle not in cleared_settlement_bill_nos:
+                                        quoted_bno_col = quote_identifier("BillNo", dialect_name)
+                                        conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_bno_col} = :bno"), {"bno": b_no_for_settle})
+                                        cleared_settlement_bill_nos.add(b_no_for_settle)
 
                         leaf_rows_by_cols.setdefault(tuple(row_insert_cols), []).append((param_dict, int(row_idx)))
                         if progress_callback and (i % 500 == 0 or i == num_entities - 1):
@@ -1912,11 +2009,11 @@ class MigrationEngine:
                             elif duplicate_action == "override":
                                 target_pk_col = billno_schema_col or "BillNo"
                                 update_cols = [c for c in row_insert_cols if c != target_pk_col and c not in identity_cols and _norm_invoice_column(c) != "billno"]
-                                quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in update_cols]
-                                upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(target_pk_col, dialect_name)} = :_override_bno")
-                                upd_params = dict(param_dict)
+                                upd_params = {c: param_dict[c] for c in update_cols if c in param_dict}
                                 upd_params["_override_bno"] = existing_b_id
-                                conn.execute(upd_stmt, upd_params)
+                                table_updates_list.append(upd_params)
+                                table_update_cols = update_cols
+                                table_update_pk_col = target_pk_col
 
                                 if existing_b_id is not None:
                                     id_store.register_id(table_name, str(bill_inv).strip(), existing_b_id)
@@ -1966,11 +2063,11 @@ class MigrationEngine:
                             elif duplicate_action == "override" and existing_o_id is not None:
                                 order_pk_col = pk_cols[0] if pk_cols else "Order_ID"
                                 update_cols = [c for c in row_insert_cols if c != order_pk_col and c not in identity_cols]
-                                quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in update_cols]
-                                upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(order_pk_col, dialect_name)} = :_override_oid")
-                                upd_params = dict(param_dict)
+                                upd_params = {c: param_dict[c] for c in update_cols if c in param_dict}
                                 upd_params["_override_oid"] = existing_o_id
-                                conn.execute(upd_stmt, upd_params)
+                                table_updates_list.append(upd_params)
+                                table_update_cols = update_cols
+                                table_update_pk_col = order_pk_col
 
                                 id_store.register_id(table_name, ord_key, existing_o_id)
                                 id_store.register_row_id(table_name, int(row_idx), existing_o_id)
@@ -2010,6 +2107,7 @@ class MigrationEngine:
                     identity_insert_enabled = False
                     needs_identity_insert = (
                         dialect_name == "mssql"
+                        and not table_identity_insert_active
                         and (
                             bills_billno_identity_insert
                             or any(
@@ -2138,6 +2236,12 @@ class MigrationEngine:
                                 conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} OFF"))
                             except Exception:
                                 logger.exception("Failed to disable IDENTITY_INSERT for %s after insert failure", table_name)
+                        if table_identity_insert_active:
+                            try:
+                                conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} OFF"))
+                                table_identity_insert_active = False
+                            except Exception:
+                                pass
                         err_str = str(ins_err)
                         # Resilient override fallback: if insert failed on PK_Bills duplicate key, override via UPDATE
                         if normalized_table_name in ("bill", "bills") and ("PK_Bills" in err_str or "2627" in err_str or "duplicate key" in err_str.lower()):
@@ -2216,6 +2320,33 @@ class MigrationEngine:
                                     tbl_idx + 1,
                                     len(active_tables_ordered)
                                 )
+
+                # Execute accumulated batch updates for overridden records (e.g. Bills, Order)
+                if table_updates_list and table_update_cols and table_update_pk_col:
+                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in table_update_cols]
+                    param_key = "_override_bno" if normalized_table_name in ("bill", "bills") else "_override_oid"
+                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(table_update_pk_col, dialect_name)} = :{param_key}")
+                    BATCH_SIZE = 500
+                    for c_idx in range(0, len(table_updates_list), BATCH_SIZE):
+                        chunk_upd = table_updates_list[c_idx:c_idx + BATCH_SIZE]
+                        try:
+                            conn.execute(upd_stmt, chunk_upd)
+                        except Exception as upd_err:
+                            logger.warning(
+                                f"[BATCH_UPDATE_FALLBACK] Table '{table_name}' batch update failed ({upd_err}); "
+                                f"executing row-by-row."
+                            )
+                            for single_p in chunk_upd:
+                                conn.execute(upd_stmt, single_p)
+
+                # Disable table-level IDENTITY_INSERT if active
+                if table_identity_insert_active:
+                    try:
+                        conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} OFF"))
+                        table_identity_insert_active = False
+                        logger.info(f"[PERF] Disabled SET IDENTITY_INSERT {quoted_tbl} OFF at table completion")
+                    except Exception:
+                        pass
 
                 t1 = time.time()
                 logger.info(
