@@ -207,6 +207,12 @@ class MissingValueResolver:
         if table_name in cls._index_cache:
             return cls._index_cache[table_name]
 
+        norm_t = str(table_name).lower().replace("dbo.", "").replace("_", "").replace(" ", "").strip()
+        if norm_t in ("order", "orders", "orderlineitems", "settlement", "settlements", "bill", "bills"):
+            index = TableEntityLookupIndex([], [])
+            cls._index_cache[table_name] = index
+            return index
+
         identifying_cols = lookup_columns or identify_table_lookup_columns(table_meta)
         req_cols = [c.name for c in table_meta.columns if not c.nullable and not getattr(c, "identity", False)]
         all_cols_to_fetch = list(set(identifying_cols + req_cols + (additional_columns or [])))

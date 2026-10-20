@@ -553,6 +553,15 @@ class MigrationEngine:
             if t not in active_tables_ordered:
                 active_tables_ordered.append(t)
 
+        seen_table_keys = set()
+        deduped_active_tables = []
+        for t in active_tables_ordered:
+            table_k = str(t).lower().replace("dbo.", "").replace("_", "").replace(" ", "").strip()
+            if table_k not in seen_table_keys:
+                seen_table_keys.add(table_k)
+                deduped_active_tables.append(t)
+        active_tables_ordered = deduped_active_tables
+
         logger.info(f"[MIGRATION] Active tables to execute in order: {active_tables_ordered}")
 
 
@@ -734,6 +743,7 @@ class MigrationEngine:
             source_row_indices_with_insert: Set[int] = set()
             fk_propagated_count: int = 0
             reused_invoices: Set[str] = set()
+            unres_nullable_fk_counts: Dict[Tuple[str, str], int] = {}
 
             # Pre-convert DataFrame to record dictionaries once for 50x faster row access
             df_records = df.to_dict(orient="records")
@@ -766,126 +776,13 @@ class MigrationEngine:
             existing_db_orders_by_billno: Dict[Any, Any] = {}
             cleared_order_ids: Set[Any] = set()
             cleared_settlement_bill_nos: Set[Any] = set()
+            skipped_order_ids: Set[Any] = set()
+            skipped_bill_nos: Set[Any] = set()
 
-            if invoice_source_col:
-                raw_excel_vals = df[invoice_source_col].dropna().unique()
-                excel_invoice_values = []
-                for val in raw_excel_vals:
-                    if invoice_identity_key(val):
-                        excel_invoice_values.append(_to_native_py(val))
-
-                bill_meta_for_prefetch = next(
-                    (t for name, t in schema_tables.items() if _norm_str(name) in ("bill", "bills")),
-                    None
-                )
-                if bill_meta_for_prefetch and excel_invoice_values:
-                    billno_prefetch_col = next((c.name for c in bill_meta_for_prefetch.columns if _norm_str(c.name) == "billno"), None) or "BillNo"
-                    billnum_prefetch_col = (
-                        next((c.name for c in bill_meta_for_prefetch.columns if _norm_str(c.name) == "billnumber"), None)
-                        or next((c.name for c in bill_meta_for_prefetch.columns if _norm_str(c.name) == "billno"), None)
-                        or billno_prefetch_col
-                    )
-                    has_order_id_in_bills = any(_norm_str(c.name) == "orderid" for c in bill_meta_for_prefetch.columns)
-                    order_id_col_sql = ", [Order_ID]" if has_order_id_in_bills else ""
-
-                    quoted_bill_prefetch_tbl = quote_identifier(bill_meta_for_prefetch.name, dialect_name)
-                    quoted_billno_pref = quote_identifier(billno_prefetch_col, dialect_name)
-                    quoted_billnum_pref = quote_identifier(billnum_prefetch_col, dialect_name)
-
-                    CHUNK_SIZE = 500
-                    for chunk_start in range(0, len(excel_invoice_values), CHUNK_SIZE):
-                        chunk = excel_invoice_values[chunk_start:chunk_start + CHUNK_SIZE]
-                        params = {f"inv_{idx}": _to_native_py(val) for idx, val in enumerate(chunk)}
-                        placeholders = ", ".join(f":inv_{idx}" for idx in range(len(chunk)))
-                        fetch_sql = (
-                            f"SELECT {quoted_billno_pref} AS BillNo, {quoted_billnum_pref} AS Bill_Number{order_id_col_sql} "
-                            f"FROM {quoted_bill_prefetch_tbl} "
-                            f"WHERE {quoted_billno_pref} IN ({placeholders}) OR {quoted_billnum_pref} IN ({placeholders})"
-                        )
-                        try:
-                            rows = conn.execute(text(fetch_sql), params).mappings().all()
-                            for r in rows:
-                                b_no = r.get("BillNo")
-                                b_num = r.get("Bill_Number")
-                                o_id = r.get("Order_ID")
-                                bill_info = {"BillNo": b_no, "Bill_Number": b_num, "Order_ID": o_id}
-                                for k in (invoice_identity_key(b_num), invoice_identity_key(b_no), str(b_num or "").strip(), str(b_no or "").strip()):
-                                    if k:
-                                        existing_db_bills[k] = bill_info
-                                        if b_no is not None:
-                                            id_store.register_id("Bills", k, b_no)
-                                            id_store.register_id("Bills", normalize_string(k), b_no)
-                                if o_id is not None:
-                                    for k in (str(b_no or "").strip(), invoice_identity_key(b_no), str(b_num or "").strip(), invoice_identity_key(b_num)):
-                                        if k:
-                                            existing_db_orders_by_billno[k] = o_id
-                                            id_store.register_id("Order", k, o_id)
-                                            id_store.register_id("Order", normalize_string(k), o_id)
-                                            if str(k).isdigit():
-                                                try:
-                                                    existing_db_orders_by_billno[int(k)] = o_id
-                                                except (ValueError, OverflowError):
-                                                    pass
-                        except Exception as fetch_err:
-                            logger.warning(f"[INVOICE_PREFETCH] Bulk lookup warning: {fetch_err}")
-
-                    if existing_db_bills:
-                        order_meta_for_prefetch = next(
-                            (t for name, t in schema_tables.items() if _norm_str(name) in ("order", "orders")),
-                            None
-                        )
-                        if order_meta_for_prefetch:
-                            order_pk = next((c.name for c in order_meta_for_prefetch.columns if c.primary_key), "Order_ID")
-                            order_bno = next((c.name for c in order_meta_for_prefetch.columns if _norm_str(c.name) == "billno"), None)
-                            if order_bno:
-                                existing_bill_ids = [b["BillNo"] for b in existing_db_bills.values() if b.get("BillNo") is not None]
-                                quoted_ord_tbl = quote_identifier(order_meta_for_prefetch.name, dialect_name)
-                                quoted_opk = quote_identifier(order_pk, dialect_name)
-                                quoted_obno = quote_identifier(order_bno, dialect_name)
-                                for chunk_start in range(0, len(existing_bill_ids), CHUNK_SIZE):
-                                    chunk = existing_bill_ids[chunk_start:chunk_start + CHUNK_SIZE]
-                                    params = {f"b_{idx}": str(_to_native_py(val)) for idx, val in enumerate(chunk)}
-                                    placeholders = ", ".join(f":b_{idx}" for idx in range(len(chunk)))
-                                    ord_sql = f"SELECT {quoted_opk} AS Order_ID, {quoted_obno} AS BillNo FROM {quoted_ord_tbl} WHERE {quoted_obno} IN ({placeholders})"
-                                    try:
-                                        rows = conn.execute(text(ord_sql), params).mappings().all()
-                                        for r in rows:
-                                            r_oid = r.get("Order_ID")
-                                            r_bno = r.get("BillNo")
-                                            if r_oid is not None and r_bno is not None:
-                                                r_bno_str = str(r_bno).strip()
-                                                existing_db_orders_by_billno[r_bno_str] = r_oid
-                                                existing_db_orders_by_billno[invoice_identity_key(r_bno)] = r_oid
-                                                id_store.register_id("Order", r_bno_str, r_oid)
-                                                id_store.register_id("Order", invoice_identity_key(r_bno), r_oid)
-                                                if r_bno_str.isdigit():
-                                                    try:
-                                                        existing_db_orders_by_billno[int(r_bno_str)] = r_oid
-                                                    except (ValueError, OverflowError):
-                                                        pass
-                                    except Exception as ord_err:
-                                        logger.warning(f"[ORDER_PREFETCH] Bulk order lookup warning: {ord_err}")
-
-                        # Also cross-link Order by Bill_Number so any format finds it in memory
-                        for b_inf in existing_db_bills.values():
-                            b_no_v = b_inf.get("BillNo")
-                            b_num_v = b_inf.get("Bill_Number")
-                            if b_no_v is not None:
-                                o_id_m = (
-                                    existing_db_orders_by_billno.get(str(b_no_v).strip())
-                                    or existing_db_orders_by_billno.get(invoice_identity_key(b_no_v))
-                                )
-                                if o_id_m is not None and b_num_v:
-                                    b_num_s = str(b_num_v).strip()
-                                    existing_db_orders_by_billno[b_num_s] = o_id_m
-                                    existing_db_orders_by_billno[invoice_identity_key(b_num_v)] = o_id_m
-                                    id_store.register_id("Order", b_num_s, o_id_m)
-                                    id_store.register_id("Order", invoice_identity_key(b_num_v), o_id_m)
-
-                logger.info(
-                    "[INVOICE_PREFETCH] Completed in-memory check: found %d existing bills out of %d Excel invoices (duplicate_action=%s)",
-                    len(existing_db_bills), len(excel_invoice_values) if excel_invoice_values else 0, duplicate_action
-                )
+            # Excel-only deduplication: All duplicate checking occurs strictly in-memory within Excel.
+            # No pre-migration database queries for Bills/Order duplicates.
+            # Records proceed directly to INSERT; if a duplicate key occurs on DB insert,
+            # it is handled via override UPDATE.
 
             # Pre-index all_val_items by (column, value) for O(1) matching
             val_items_by_col: Dict[str, Dict[str, List[ValueMappingItem]]] = {}
@@ -1022,7 +919,8 @@ class MigrationEngine:
                         source_row_indices_with_insert=source_row_indices_with_insert,
                         progress_callback=progress_callback,
                         tbl_idx=tbl_idx,
-                        total_tables=len(active_tables_ordered)
+                        total_tables=len(active_tables_ordered),
+                        outlet_id_cache=outlet_id_cache
                     )
                     t1 = time.time()
                     logger.info(
@@ -1035,56 +933,21 @@ class MigrationEngine:
                 if not identifying_db_cols:
                     identifying_db_cols = [c for c in target_db_cols if c not in identity_cols][:2]
 
-                # 5.1 Read existing business keys only to seed ID resolution for foreign keys.
-                # This is NOT duplicate detection: non-Customer rows must always follow the
-                # existing INSERT path, even when their values match existing database rows.
+                # 5.1 Strictly NO database duplicate checking queries:
+                # All duplicate checking is performed strictly in-memory on Excel data.
+                # Tables proceed directly to INSERT; generated IDs are registered in id_store as rows are inserted.
                 quoted_tbl = quote_identifier(table_name, dialect_name)
-                select_cols = list(dict.fromkeys(identifying_db_cols + pk_cols))
-
                 normalized_table_name = table_name.lower().replace("dbo.", "").strip()
                 referenced_parent_names = {
                     rel.parent_table.lower().replace("dbo.", "").strip()
                     for rel in lookup_relationships
                 }
-                for child_table_name in active_tables_ordered:
-                    child_meta = schema_tables.get(child_table_name)
-                    if child_meta is None:
-                        continue
-                    for fk in getattr(child_meta, "foreign_keys", []):
-                        if getattr(fk, "target_table", None):
-                            referenced_parent_names.add(fk.target_table.lower().replace("dbo.", "").strip())
-
                 has_unique_identifying = any(col_meta_map.get(c, ColumnMetadata(name=c, type="")).unique for c in identifying_db_cols)
                 is_transaction_header = normalized_table_name in ("order", "orders", "bills", "bill", "settlements", "settlement")
 
-                if normalized_table_name in ("order", "orders") and "BillNo" in col_meta_map and "BillNo" not in select_cols:
-                    select_cols.append("BillNo")
-                if normalized_table_name in ("bills", "bill") and "Bill_Number" in col_meta_map and "Bill_Number" not in select_cols:
-                    select_cols.append("Bill_Number")
-                if normalized_table_name in ("settlements", "settlement") and "BillNo" in col_meta_map and "BillNo" not in select_cols:
-                    select_cols.append("BillNo")
-
-                if select_cols and not is_transaction_header and (normalized_table_name in referenced_parent_names or has_unique_identifying):
-                    quoted_select_cols = [quote_identifier(c, dialect_name) for c in select_cols]
-                    try:
-                        select_sql = f"SELECT {', '.join(quoted_select_cols)} FROM {quoted_tbl}"
-                        existing_res = conn.execute(text(select_sql)).mappings().all()
-                        for row_dict in existing_res:
-                            pk_val = row_dict.get(pk_cols[0]) if pk_cols else None
-                            for c in select_cols:
-                                val_str = str(row_dict.get(c, "")).strip()
-                                if val_str and pk_val is not None:
-                                    id_store.register_id(table_name, val_str, pk_val)
-                            row_key = tuple(normalize_string(str(row_dict.get(c, "") or "")) for c in identifying_db_cols)
-                            if any(row_key) and pk_val is not None:
-                                id_store.register_composite_key(table_name, row_key, pk_val)
-                    except Exception as lookup_err:
-                        logger.warning(f"[MIGRATION] Existing FK/key lookup indexing for {table_name}: {lookup_err}")
-
-                # 5.2 Begin with all source rows. Customer duplicate detection is the
-                # only database duplicate check. For this item-level report, Order and
-                # Bills are invoice-header tables: aggregate their source rows to one
-                # row per invoice while preserving every row for OrderLineItems.
+                # 5.2 Begin with all source rows. Duplicate handling is strictly in Excel memory.
+                # For this item-level report, Order and Bills are invoice-header tables: aggregate
+                # their source rows to one row per invoice while preserving every row for OrderLineItems.
                 entities_df = df
                 entities_records = entities_df.to_dict(orient="records")
                 entities_df_indices = entities_df.index.tolist()
@@ -1298,6 +1161,75 @@ class MigrationEngine:
                 table_update_cols: List[str] = []
                 table_update_pk_col: Optional[str] = None
 
+                # High-performance order & bills batch inserts collectors
+                order_pending_inserts: List[Tuple[Dict[str, Any], List[str], int, Any, Tuple[Any, ...], Optional[Any]]] = []
+                bills_pending_inserts: List[Tuple[Dict[str, Any], List[str], int, Any, Tuple[Any, ...], Optional[Any]]] = []
+
+                # Precompute table-level loop invariants to eliminate redundant function calls
+                unmapped_empty_cols = [
+                    _c.name for _c in t_meta.columns
+                    if should_fill_unmapped_text_column(_c, t_meta, table_fk_cols)
+                ]
+
+                norm_table_clean = normalized_table_name.replace("_", "").replace(" ", "")
+                source_item_quantity_col = None
+                target_quantity_col = None
+                if norm_table_clean == "orderlineitems":
+                    def _norm_quantity_name(value: Any) -> str:
+                        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+                    source_item_quantity_col = next(
+                        (c for c in df.columns if _norm_quantity_name(c) == "itemquantity"),
+                        None,
+                    )
+                    target_quantity_col = next(
+                        (c for c in col_meta_map if _norm_quantity_name(c) == "quantity"),
+                        None,
+                    )
+
+                settlement_total_source_col = None
+                settlement_columns: Dict[str, Any] = {}
+                if norm_table_clean in ("settlement", "settlements"):
+                    def _norm_settlement_col(value: Any) -> str:
+                        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+                    settlement_total_source_col = next(
+                        (c for c in df.columns if _norm_settlement_col(c) == "total"),
+                        None,
+                    )
+                    for c in t_meta.columns:
+                        n_c = _norm_settlement_col(c.name)
+                        if n_c in {
+                            "cash", "creditcard", "sodexo", "cheque", "complementary",
+                            "others", "servicefailure", "debitcard", "ticketrestaurant",
+                            "ge", "bo", "return", "othersettlement", "othersettlementname",
+                        }:
+                            settlement_columns[n_c] = c
+                            if not getattr(c, "identity", False) and c.name not in insert_cols:
+                                insert_cols.append(c.name)
+
+                # Precompute invoice target columns for Bills once
+                invoice_target_cols_bills = []
+                if normalized_table_name in ("bill", "bills") and invoice_source_col:
+                    if mapped_billno_col:
+                        invoice_target_cols_bills.append(mapped_billno_col)
+                    if billnumber_schema_col:
+                        invoice_target_cols_bills.append(billnumber_schema_col)
+                    for _c in col_meta_map:
+                        if _norm_invoice_column(_c) in {"billno", "billnumber", "billnum", "invoiceno", "invoicenumber", "invoicenum"}:
+                            if _c not in invoice_target_cols_bills:
+                                invoice_target_cols_bills.append(_c)
+
+                # Precompute valid outlet ids once
+                valid_outlet_ids_by_parent: Dict[str, Set[str]] = {}
+                for fk_col_name, (p_t, p_c) in fk_injections.items():
+                    if p_t.lower() in ("outlets", "dbo.outlets"):
+                        valid_outlet_ids_by_parent[p_t] = {
+                            str(record.get(p_c))
+                            for record in parent_records_by_table.get(p_t, [])
+                            if record.get(p_c) is not None
+                        }
+
                 # Table-level IDENTITY_INSERT for MSSQL (avoids per-row toggling roundtrips)
                 table_identity_insert_active = False
                 if dialect_name == "mssql" and bills_billno_identity_insert:
@@ -1387,32 +1319,9 @@ class MigrationEngine:
                     # invoice/BillNo mapping, and all OrderLineItems quantity logic.
                     # Cash receives the source invoice-level `total`; all other payment
                     # buckets are 0 except Service_Failure and OtherSettlement (SQL NULL).
-                    if normalized_table_name.replace("_", "").replace(" ", "") in ("settlement", "settlements"): 
-                        def _norm_settlement_col(value: Any) -> str:
-                            return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
-
-                        settlement_total_source_col = next(
-                            (c for c in df.columns if _norm_settlement_col(c) == "total"),
-                            None,
-                        )
-                        settlement_columns = {
-                            _norm_settlement_col(c.name): c for c in t_meta.columns
-                        }
-
-                        # Always include these fields in the actual INSERT column list.
+                    if norm_table_clean in ("settlement", "settlements"): 
                         for normalized_name, column_meta in settlement_columns.items():
-                            if normalized_name not in {
-                                "cash", "creditcard", "sodexo", "cheque", "complementary",
-                                "others", "servicefailure", "debitcard", "ticketrestaurant",
-                                "ge", "bo", "return", "othersettlement", "othersettlementname",
-                            }:
-                                continue
                             column_name = column_meta.name
-                            if getattr(column_meta, "identity", False):
-                                continue
-                            if column_name not in insert_cols:
-                                insert_cols.append(column_name)
-
                             if normalized_name == "cash":
                                 raw_total = get_df_val(row, settlement_total_source_col) if settlement_total_source_col else None
                                 param_dict[column_name] = sanitize_value(
@@ -1431,33 +1340,9 @@ class MigrationEngine:
                                     expects_empty_string=False,
                                 )
 
-                        if settlement_total_source_col is None:
-                            logger.warning(
-                                "[SETTLEMENT_CASH_TOTAL_MISSING] upload_id=%s source_row=%s; "
-                                "Excel `total` column not found, Cash will be NULL.",
-                                upload_id, source_row_num,
-                            )
-                        logger.debug(
-                            "[SETTLEMENT_CASH_TOTAL] upload_id=%s source_row=%s source_column=%s value=%r",
-                            upload_id, source_row_num, settlement_total_source_col,
-                            get_df_val(row, settlement_total_source_col) if settlement_total_source_col else None,
-                        )
-
                     # OrderLineItems quantity must come directly from the source
-                    # item's item_quantity column. Do not let generic/fuzzy mapping
-                    # choose item_price, item_total, or another numeric column.
-                    if normalized_table_name.replace("_", "").replace(" ", "") == "orderlineitems":
-                        def _norm_quantity_name(value: Any) -> str:
-                            return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
-
-                        source_item_quantity_col = next(
-                            (c for c in df.columns if _norm_quantity_name(c) == "itemquantity"),
-                            None,
-                        )
-                        target_quantity_col = next(
-                            (c for c in col_meta_map if _norm_quantity_name(c) == "quantity"),
-                            None,
-                        )
+                    # item's item_quantity column.
+                    if norm_table_clean == "orderlineitems":
                         if source_item_quantity_col and target_quantity_col:
                             raw_item_quantity = get_df_val(row, source_item_quantity_col)
                             quantity_meta = col_meta_map[target_quantity_col]
@@ -1469,32 +1354,14 @@ class MigrationEngine:
                             )
                             if target_quantity_col not in insert_cols:
                                 insert_cols.append(target_quantity_col)
-                            logger.debug(
-                                "[ORDER_LINE_QUANTITY_MAPPING] upload_id=%s source_row=%s "
-                                "source_column=%s source_value=%r target_column=%s final_value=%r",
-                                upload_id, source_row_num, source_item_quantity_col,
-                                raw_item_quantity, target_quantity_col,
-                                param_dict[target_quantity_col],
-                            )
 
                     # Force Excel invoice number into BOTH BillNo and Bill_Number (and any other invoice columns)
                     if normalized_table_name in ("bill", "bills") and invoice_source_col:
                         invoice_raw_value = get_df_val(row, invoice_source_col)
-                        invoice_target_cols = []
-                        if mapped_billno_col:
-                            invoice_target_cols.append(mapped_billno_col)
-                        if billnumber_schema_col:
-                            invoice_target_cols.append(billnumber_schema_col)
-                        for _c in col_meta_map:
-                            if _norm_invoice_column(_c) in {"billno", "billnumber", "billnum", "invoiceno", "invoicenumber", "invoicenum"}:
-                                if _c not in invoice_target_cols:
-                                    invoice_target_cols.append(_c)
-
-                        for invoice_target_col in dict.fromkeys(invoice_target_cols):
+                        for invoice_target_col in invoice_target_cols_bills:
                             if invoice_target_col in identity_cols and not bills_billno_identity_insert:
                                 continue
                             invoice_col_meta = col_meta_map[invoice_target_col]
-                            # If column is integer but invoice string is non-numeric, do not insert non-numeric string into INT PK
                             c_type_upper = str(invoice_col_meta.type).upper()
                             is_int_col = any(it in c_type_upper for it in ("INT", "BIGINT", "SMALLINT", "TINYINT"))
                             if is_int_col:
@@ -1513,10 +1380,8 @@ class MigrationEngine:
                             )
 
                     # Populate unmapped/missing optional text columns with empty strings.
-                    # This covers fields such as Description that the user did not fill in.
-                    for _column in t_meta.columns:
-                        if should_fill_unmapped_text_column(_column, t_meta, table_fk_cols):
-                            param_dict.setdefault(_column.name, "")
+                    for _column_name in unmapped_empty_cols:
+                        param_dict.setdefault(_column_name, "")
 
                     # Resolve Foreign Keys from DynamicLookupResolver & IdResolverStore
                     row_resolved_entities: Dict[str, ResolvedEntityRecord] = {}
@@ -1666,13 +1531,31 @@ class MigrationEngine:
                             if n_val is not None and not is_empty_or_na(n_val):
                                 has_own_source = True
 
-                        if resolved_parent_id is None and (num_parent_refs == 1 or not has_own_source or "order" in fk_col.lower()):
+                        if resolved_parent_id is None and (num_parent_refs == 1 or not has_own_source or "order" in fk_col.lower() or "customer" in fk_col.lower()):
                             if id_store.has_row_id(parent_tbl, int(row_idx)):
                                 resolved_parent_id = id_store.get_row_id(parent_tbl, int(row_idx))
+                            elif order_source_rows_by_invoice:
+                                cur_inv = get_df_val(row, order_invoice_column) if order_invoice_column else (get_df_val(row, invoice_source_col) if invoice_source_col else None)
+                                if cur_inv is not None:
+                                    inv_k = str(cur_inv).strip().casefold()
+                                    for s_idx in order_source_rows_by_invoice.get(inv_k, []):
+                                        if id_store.has_row_id(parent_tbl, int(s_idx)):
+                                            resolved_parent_id = id_store.get_row_id(parent_tbl, int(s_idx))
+                                            break
+                            if resolved_parent_id is None and invoice_source_col:
+                                inv_val = get_df_val(row, invoice_source_col)
+                                if inv_val is not None:
+                                    inv_k = str(inv_val).strip()
+                                    resolved_parent_id = id_store.get_id(parent_tbl, inv_k.casefold()) or id_store.get_id(parent_tbl, inv_k)
 
                         # Step 3: Check business names/keys in the same row for parent table
                         if resolved_parent_id is None:
                             parent_mappings = table_mappings_map.get(parent_tbl, [])
+                            if not parent_mappings:
+                                for t_k in [parent_tbl, parent_tbl.replace("dbo.", ""), f"dbo.{parent_tbl}"]:
+                                    if t_k in table_mappings_map:
+                                        parent_mappings = table_mappings_map[t_k]
+                                        break
                             for pm in parent_mappings:
                                 p_raw = get_df_val(row, pm.excel_column)
                                 if p_raw is not None and not is_empty_or_na(p_raw):
@@ -1681,6 +1564,19 @@ class MigrationEngine:
                                         resolved_parent_id = id_store.get_id(parent_tbl, normalize_string(str(p_raw)))
                                     if resolved_parent_id is not None:
                                         break
+
+                        # Step 3b: Customer mobile/phone identity lookup for Customer_ID
+                        if resolved_parent_id is None and str(parent_tbl or "").lower().replace("dbo.", "").strip() == "customer":
+                            for col_k in ("mobile", "phone", "contact"):
+                                c_ex = next((m.excel_column for m in mappings if col_k in m.database_column.lower() and m.excel_column in df.columns), None)
+                                if c_ex:
+                                    c_val = get_df_val(row, c_ex)
+                                    if c_val is not None and not is_empty_or_na(c_val):
+                                        from app.migration.customer_dedup import normalize_mobile
+                                        nm_mob = normalize_mobile(c_val)
+                                        if nm_mob and id_store.has_id(parent_tbl, nm_mob):
+                                            resolved_parent_id = id_store.get_id(parent_tbl, nm_mob)
+                                            break
 
                         # Step 4: Check DynamicLookupResolver matching against actual database records (cached)
                         if resolved_parent_id is None:
@@ -1769,11 +1665,14 @@ class MigrationEngine:
                             # never overwrite OrderLineItems price with ItemsMaster price.
 
                             if parent_tbl.lower() in ("outlets", "dbo.outlets"):
-                                valid_outlet_ids = {
-                                    str(record.get(parent_col))
-                                    for record in parent_records_by_table.get(parent_tbl, [])
-                                    if record.get(parent_col) is not None
-                                }
+                                valid_outlet_ids = valid_outlet_ids_by_parent.get(parent_tbl)
+                                if valid_outlet_ids is None:
+                                    valid_outlet_ids = {
+                                        str(record.get(parent_col))
+                                        for record in parent_records_by_table.get(parent_tbl, [])
+                                        if record.get(parent_col) is not None
+                                    }
+                                    valid_outlet_ids_by_parent[parent_tbl] = valid_outlet_ids
                                 if (
                                     not isinstance(param_dict[fk_col], int)
                                     or isinstance(param_dict[fk_col], bool)
@@ -1784,21 +1683,23 @@ class MigrationEngine:
                                         f"for {parent_tbl}.{parent_col}; final parameter={param_dict[fk_col]!r} "
                                         f"({type(param_dict[fk_col]).__name__})."
                                     )
-                                logger.info(
-                                    "[OUTLET_FK_PARAMETER] upload_id=%s source_row=%s target=%s.%s "
-                                    "parent=%s.%s value=%r type=%s",
-                                    upload_id, source_row_num, table_name, fk_col,
-                                    parent_tbl, parent_col, param_dict[fk_col],
-                                    type(param_dict[fk_col]).__name__
-                                )
+                                if source_row_num <= 5 or source_row_num % 1000 == 0 or source_row_num == num_entities:
+                                    logger.info(
+                                        "[OUTLET_FK_PARAMETER] upload_id=%s source_row=%s target=%s.%s "
+                                        "parent=%s.%s value=%r type=%s",
+                                        upload_id, source_row_num, table_name, fk_col,
+                                        parent_tbl, parent_col, param_dict[fk_col],
+                                        type(param_dict[fk_col]).__name__
+                                    )
                             else:
-                                logger.info(
-                                    "[LOOKUP_FK_RESOLVED] upload_id=%s source_row=%s target=%s.%s "
-                                    "parent=%s.%s source_val=%r resolved_id=%r match_method=%s",
-                                    upload_id, source_row_num, table_name, fk_col,
-                                    parent_tbl, parent_col, source_val, param_dict[fk_col],
-                                    getattr(res_rec, "match_method", "LOOKUP") if "res_rec" in locals() and res_rec else "STORE"
-                                )
+                                if source_row_num <= 5 or source_row_num % 1000 == 0 or source_row_num == num_entities:
+                                    logger.info(
+                                        "[LOOKUP_FK_RESOLVED] upload_id=%s source_row=%s target=%s.%s "
+                                        "parent=%s.%s source_val=%r resolved_id=%r match_method=%s",
+                                        upload_id, source_row_num, table_name, fk_col,
+                                        parent_tbl, parent_col, source_val, param_dict[fk_col],
+                                        getattr(res_rec, "match_method", "LOOKUP") if "res_rec" in locals() and res_rec else "STORE"
+                                    )
                         elif fk_col not in param_dict or param_dict[fk_col] is None:
                             c_meta = col_meta_map.get(fk_col)
                             is_item_fk = is_item_master_target(parent_tbl, table_name, fk_col)
@@ -1857,11 +1758,15 @@ class MigrationEngine:
                             if is_nullable:
                                 param_dict[c] = None
                                 row_insert_cols.append(c)
-                                logger.warning(
-                                    "[FK_NULL_UNRESOLVED] upload_id=%s source_row=%s target=%s.%s; "
-                                    "no parent ID resolved; inserting SQL NULL because the FK column is nullable",
-                                    upload_id, source_row_num, table_name, c
-                                )
+                                unres_k = (table_name, c)
+                                unres_cnt = unres_nullable_fk_counts.get(unres_k, 0) + 1
+                                unres_nullable_fk_counts[unres_k] = unres_cnt
+                                if unres_cnt <= 3:
+                                    logger.info(
+                                        "[FK_NULL_UNRESOLVED] upload_id=%s source_row=%s target=%s.%s; "
+                                        "no parent ID resolved; inserting SQL NULL because the FK column is nullable (sample %d)",
+                                        upload_id, source_row_num, table_name, c, unres_cnt
+                                    )
                                 continue
                             if has_default:
                                 # Allow the database's declared default to apply when present.
@@ -1949,33 +1854,15 @@ class MigrationEngine:
                     # defer insertion to execute in high-performance batch chunks.
                     if is_leaf_table:
                         if normalized_table_name.replace("_", "").replace(" ", "") == "orderlineitems":
-                            line_inv = get_df_val(row, invoice_source_col) if invoice_source_col else None
-                            line_key = invoice_identity_key(line_inv) if line_inv is not None else ""
-                            if line_key and line_key in existing_db_bills:
-                                if duplicate_action == "skip":
-                                    t_stat.skipped += 1
-                                    continue
-                                elif duplicate_action == "override":
-                                    oid_for_line = param_dict.get("Order_ID")
-                                    if oid_for_line is not None and oid_for_line not in cleared_order_ids:
-                                        quoted_oid_col = quote_identifier("Order_ID", dialect_name)
-                                        conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_oid_col} = :oid"), {"oid": oid_for_line})
-                                        cleared_order_ids.add(oid_for_line)
+                            oid_for_line = param_dict.get("Order_ID")
+                            if oid_for_line is not None and oid_for_line in skipped_order_ids:
+                                t_stat.skipped += 1
+                                continue
                         elif normalized_table_name.replace("_", "").replace(" ", "") in ("settlement", "settlements"):
-                            settle_inv = get_df_val(row, settlement_invoice_col) if settlement_invoice_col else (get_df_val(row, invoice_source_col) if invoice_source_col else None)
-                            settle_key = invoice_identity_key(settle_inv) if settle_inv is not None else ""
-                            if settle_key and settle_key in existing_db_bills:
-                                if duplicate_action == "skip":
-                                    t_stat.skipped += 1
-                                    continue
-                                elif duplicate_action == "override":
-                                    b_no_for_settle = param_dict.get("BillNo")
-                                    if b_no_for_settle is None and settle_key:
-                                        b_no_for_settle = id_store.get_id("Bills", settle_key) or id_store.get_id("Bills", normalize_string(str(settle_key)))
-                                    if b_no_for_settle is not None and b_no_for_settle not in cleared_settlement_bill_nos:
-                                        quoted_bno_col = quote_identifier("BillNo", dialect_name)
-                                        conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_bno_col} = :bno"), {"bno": b_no_for_settle})
-                                        cleared_settlement_bill_nos.add(b_no_for_settle)
+                            b_no_for_settle = param_dict.get("BillNo")
+                            if b_no_for_settle is not None and b_no_for_settle in skipped_bill_nos:
+                                t_stat.skipped += 1
+                                continue
 
                         leaf_rows_by_cols.setdefault(tuple(row_insert_cols), []).append((param_dict, int(row_idx)))
                         if progress_callback and (i % 500 == 0 or i == num_entities - 1):
@@ -2040,17 +1927,7 @@ class MigrationEngine:
                             )
 
                             if existing_o_id is None:
-                                order_pk_col_lookup = pk_cols[0] if pk_cols else "Order_ID"
-                                order_bno_col_lookup = next((c for c in col_meta_map if _norm_str(c) == "billno"), "BillNo")
-                                try:
-                                    found_oid = conn.execute(
-                                        text(f"SELECT {quote_identifier(order_pk_col_lookup, dialect_name)} FROM {quoted_tbl} WHERE {quote_identifier(order_bno_col_lookup, dialect_name)} = :bno"),
-                                        {"bno": str(ord_inv or b_no or "").strip()}
-                                    ).scalar()
-                                    if found_oid is not None:
-                                        existing_o_id = found_oid
-                                except Exception:
-                                    pass
+                                existing_o_id = id_store.get_id(table_name, ord_key)
 
                             if duplicate_action == "skip":
                                 if existing_o_id is not None:
@@ -2094,6 +1971,30 @@ class MigrationEngine:
                                     quoted_bno_col = quote_identifier("BillNo", dialect_name)
                                     conn.execute(text(f"DELETE FROM {quoted_tbl} WHERE {quoted_bno_col} = :bno"), {"bno": b_no_for_settle})
                                     cleared_settlement_bill_nos.add(b_no_for_settle)
+
+                    # For Order table, accumulate rows for high-performance multi-row batch execution
+                    if normalized_table_name in ("order", "orders"):
+                        order_pending_inserts.append((
+                            dict(param_dict),
+                            list(row_insert_cols),
+                            int(row_idx),
+                            row,
+                            row_key_tuple,
+                            get_df_val(row, order_invoice_column) if order_invoice_column else None
+                        ))
+                        continue
+
+                    # For Bills table, accumulate rows for high-performance multi-row batch execution
+                    if normalized_table_name in ("bill", "bills"):
+                        bills_pending_inserts.append((
+                            dict(param_dict),
+                            list(row_insert_cols),
+                            int(row_idx),
+                            row,
+                            row_key_tuple,
+                            get_df_val(row, invoice_source_col) if invoice_source_col else None
+                        ))
+                        continue
 
                     # Verify 1-to-1 parameter matching
                     row_quoted_insert_cols = [quote_identifier(c, dialect_name) for c in row_insert_cols]
@@ -2242,27 +2143,79 @@ class MigrationEngine:
                                 table_identity_insert_active = False
                             except Exception:
                                 pass
-                        err_str = str(ins_err)
-                        # Resilient override fallback: if insert failed on PK_Bills duplicate key, override via UPDATE
-                        if normalized_table_name in ("bill", "bills") and ("PK_Bills" in err_str or "2627" in err_str or "duplicate key" in err_str.lower()):
+                        err_str = str(ins_err).lower()
+                        # Resilient duplicate key fallback: handle override or skip when duplicate primary/unique key occurs
+                        if normalized_table_name in ("bill", "bills") and ("pk_bills" in err_str or "2627" in err_str or "2601" in err_str or "duplicate" in err_str or "unique" in err_str or "primary key" in err_str):
                             logger.warning(
                                 "[BILLS_DUPLICATE_KEY_FALLBACK] Table '%s' duplicate primary key detected for row %s (%s); "
-                                "executing override UPDATE instead.",
-                                table_name, source_row_num, err_str
+                                "handling duplicate_action='%s'.",
+                                table_name, source_row_num, ins_err, duplicate_action
                             )
                             target_pk_col = billno_schema_col or "BillNo"
-                            b_pk_val = param_dict.get(target_pk_col) or param_dict.get("Bill_Number")
+                            b_pk_val = param_dict.get(target_pk_col)
+                            b_num_col = next((c for c in col_meta_map if _norm_str(c) in ("billnumber", "bill_number")), None)
+                            if b_num_col and param_dict.get(b_num_col):
+                                b_num_val = str(param_dict[b_num_col]).strip()
+                                existing_bno = conn.execute(
+                                    text(f"SELECT {quote_identifier(target_pk_col, dialect_name)} FROM {quoted_tbl} WHERE {quote_identifier(b_num_col, dialect_name)} = :b_num"),
+                                    {"b_num": b_num_val}
+                                ).scalar()
+                                if existing_bno is not None:
+                                    b_pk_val = existing_bno
+                            if b_pk_val is None:
+                                b_pk_val = param_dict.get("BillNo") or param_dict.get("Bill_Number")
+
                             if b_pk_val is not None:
-                                update_cols = [c for c in row_insert_cols if c != target_pk_col and c not in identity_cols and _norm_invoice_column(c) != "billno"]
+                                if duplicate_action == "skip":
+                                    skipped_bill_nos.add(b_pk_val)
+                                    id_store.register_id(table_name, str(b_pk_val).strip(), b_pk_val)
+                                    if b_num_col and param_dict.get(b_num_col):
+                                        id_store.register_id(table_name, str(param_dict[b_num_col]).strip(), b_pk_val)
+                                    id_store.register_row_id(table_name, int(row_idx), b_pk_val)
+                                    t_stat.skipped += 1
+                                    continue
+                                else:  # override
+                                    update_cols = [c for c in row_insert_cols if c != target_pk_col and c not in identity_cols and _norm_invoice_column(c) != "billno"]
+                                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in update_cols]
+                                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(target_pk_col, dialect_name)} = :_override_bno")
+                                    upd_params = dict(param_dict)
+                                    upd_params["_override_bno"] = b_pk_val
+                                    conn.execute(upd_stmt, upd_params)
+
+                                    # Also clear old settlements for this BillNo so new settlement rows override cleanly
+                                    try:
+                                        conn.execute(
+                                            text(f"DELETE FROM {quote_identifier('Settlement', dialect_name)} WHERE {quote_identifier('BillNo', dialect_name)} = :bno"),
+                                            {"bno": b_pk_val}
+                                        )
+                                    except Exception:
+                                        pass
+
+                                    id_store.register_id(table_name, str(b_pk_val).strip(), b_pk_val)
+                                    id_store.register_row_id(table_name, int(row_idx), b_pk_val)
+                                    generated_ids_by_table[table_name].append(b_pk_val)
+                                    t_stat.updated += 1
+                                    source_row_indices_with_insert.add(int(row_idx))
+                                    continue
+
+                        elif "2627" in err_str or "2601" in err_str or "duplicate key" in err_str.lower() or "primary key" in err_str.lower():
+                            logger.warning(
+                                "[DUPLICATE_KEY_FALLBACK] Table '%s' duplicate key detected for row %s (%s); attempting override UPDATE.",
+                                table_name, source_row_num, err_str
+                            )
+                            target_pk_col = pk_cols[0] if pk_cols else None
+                            pk_val = param_dict.get(target_pk_col) if target_pk_col else None
+                            if target_pk_col and pk_val is not None:
+                                update_cols = [c for c in row_insert_cols if c != target_pk_col and c not in identity_cols]
                                 quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in update_cols]
-                                upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(target_pk_col, dialect_name)} = :_override_bno")
+                                upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(target_pk_col, dialect_name)} = :_override_pk")
                                 upd_params = dict(param_dict)
-                                upd_params["_override_bno"] = b_pk_val
+                                upd_params["_override_pk"] = pk_val
                                 conn.execute(upd_stmt, upd_params)
 
-                                id_store.register_id(table_name, str(b_pk_val).strip(), b_pk_val)
-                                id_store.register_row_id(table_name, int(row_idx), b_pk_val)
-                                generated_ids_by_table[table_name].append(b_pk_val)
+                                id_store.register_id(table_name, str(pk_val).strip(), pk_val)
+                                id_store.register_row_id(table_name, int(row_idx), pk_val)
+                                generated_ids_by_table[table_name].append(pk_val)
                                 t_stat.updated += 1
                                 source_row_indices_with_insert.add(int(row_idx))
                                 continue
@@ -2273,36 +2226,437 @@ class MigrationEngine:
                         # Re-raise to trigger automatic rollback in transaction_manager
                         raise ins_err
 
-                # Execute accumulated batch inserts for leaf tables (e.g. OrderLineItems)
+                # Execute accumulated batch inserts for Order table
+                if order_pending_inserts:
+                    max_cols = max(len(it[1]) for it in order_pending_inserts)
+                    ORDER_BATCH = max(1, min(200, 2000 // max(1, max_cols)))
+                    pk_col = pk_cols[0] if pk_cols else "Order_ID"
+                    quoted_pk = quote_identifier(pk_col, dialect_name)
+
+                    def _execute_single_order(item: Any) -> None:
+                        p_dict, r_cols, r_idx, r_data, r_key_tuple, r_inv = item
+                        s_row_num = r_idx + 1
+                        r_q_cols = [quote_identifier(c, dialect_name) for c in r_cols]
+                        v_params = [f":{c}" for c in r_cols]
+                        pk_to_output = pk_cols[0] if (pk_cols and pk_cols[0] in identity_cols) else None
+                        new_id = None
+                        existing_oid = None
+                        try:
+                            if dialect_name == "mssql" and pk_to_output:
+                                quoted_pk = quote_identifier(pk_to_output, dialect_name)
+                                try:
+                                    ins_stmt = text(f"INSERT INTO {quoted_tbl} ({', '.join(r_q_cols)}) OUTPUT INSERTED.{quoted_pk} VALUES ({', '.join(v_params)})")
+                                    res = conn.execute(ins_stmt, p_dict)
+                                    new_id = res.scalar()
+                                except Exception as trg_err:
+                                    err_trg = str(trg_err).lower()
+                                    if "trigger" in err_trg or "output clause without into" in err_trg:
+                                        ins_fallback = text(f"INSERT INTO {quoted_tbl} ({', '.join(r_q_cols)}) VALUES ({', '.join(v_params)});\nSELECT SCOPE_IDENTITY();")
+                                        res = conn.execute(ins_fallback, p_dict)
+                                        new_id = res.scalar()
+                                    else:
+                                        raise trg_err
+                            elif dialect_name in ("postgresql", "postgres") and pk_cols:
+                                ins_stmt = text(f"INSERT INTO {quoted_tbl} ({', '.join(r_q_cols)}) VALUES ({', '.join(v_params)}) RETURNING {quote_identifier(pk_cols[0], dialect_name)}")
+                                res = conn.execute(ins_stmt, p_dict)
+                                new_id = res.scalar()
+                            else:
+                                ins_stmt = text(f"INSERT INTO {quoted_tbl} ({', '.join(r_q_cols)}) VALUES ({', '.join(v_params)})")
+                                res = conn.execute(ins_stmt, p_dict)
+                                new_id = getattr(res, "lastrowid", None) or p_dict.get(pk_cols[0] if pk_cols else None)
+                        except Exception as ord_ins_err:
+                            err_str = str(ord_ins_err).lower()
+                            if "2627" in err_str or "2601" in err_str or "duplicate key" in err_str or "primary key" in err_str or "unique constraint" in err_str or "unique" in err_str:
+                                pk_name = pk_cols[0] if pk_cols else "Order_ID"
+                                existing_oid = p_dict.get(pk_name)
+                                if existing_oid is None and r_inv is not None:
+                                    existing_oid = id_store.get_id(table_name, str(r_inv).strip())
+                                if existing_oid is None:
+                                    for cand_col in r_cols:
+                                        if _norm_str(cand_col) in ("invoiceno", "invoicenumber", "invoice", "billno", "billnumber", "bill_number"):
+                                            val_c = p_dict.get(cand_col)
+                                            if val_c is not None and str(val_c).strip():
+                                                q_c = quote_identifier(cand_col, dialect_name)
+                                                existing_oid = conn.execute(
+                                                    text(f"SELECT {quote_identifier(pk_name, dialect_name)} FROM {quoted_tbl} WHERE {q_c} = :val"),
+                                                    {"val": str(val_c).strip()}
+                                                ).scalar()
+                                                if existing_oid is not None:
+                                                    break
+
+                                if existing_oid is not None:
+                                    new_id = existing_oid
+                                    if duplicate_action == "skip":
+                                        skipped_order_ids.add(existing_oid)
+                                        t_stat.skipped += 1
+                                    else:
+                                        upd_cols = [c for c in r_cols if c != pk_name and c not in identity_cols]
+                                        quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                                        upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(pk_name, dialect_name)} = :_override_oid")
+                                        upd_p = dict(p_dict)
+                                        upd_p["_override_oid"] = existing_oid
+                                        conn.execute(upd_stmt, upd_p)
+                                        try:
+                                            conn.execute(text(f"DELETE FROM {quote_identifier('OrderLineItems', dialect_name)} WHERE {quote_identifier('Order_ID', dialect_name)} = :oid"), {"oid": existing_oid})
+                                        except Exception:
+                                            pass
+                                        t_stat.updated += 1
+                            else:
+                                raise ord_ins_err
+
+                        if new_id is not None:
+                            try:
+                                if isinstance(new_id, float) and new_id.is_integer():
+                                    new_id = int(new_id)
+                            except Exception:
+                                pass
+                            generated_ids_by_table[table_name].append(new_id)
+                            bno_c = next((c for c in r_cols if _norm_str(c) in ("billno", "billnumber", "bill_number")), None)
+                            if bno_c and p_dict.get(bno_c) is not None:
+                                b_val = str(p_dict[bno_c]).strip()
+                                id_store.register_id(table_name, b_val, new_id)
+                                id_store.register_id(table_name, b_val.casefold(), new_id)
+                            if r_inv is not None:
+                                inv_k = str(r_inv).strip().casefold()
+                                id_store.register_id(table_name, inv_k, new_id)
+                                for s_idx in order_source_rows_by_invoice.get(inv_k, []):
+                                    id_store.register_row_id(table_name, int(s_idx), new_id)
+                            id_store.register_row_id(table_name, int(r_idx), new_id)
+                            id_store.register_composite_key(table_name, r_key_tuple, new_id)
+                            if duplicate_action != "skip" or new_id not in skipped_order_ids:
+                                source_row_indices_with_insert.add(int(r_idx))
+                                if existing_oid is None:
+                                    t_stat.inserted += 1
+
+                    def _insert_order_subchunk(subchunk: List[Any]) -> None:
+                        if not subchunk:
+                            return
+                        if len(subchunk) == 1:
+                            _execute_single_order(subchunk[0])
+                            return
+
+                        chunk_cols = list(dict.fromkeys(c for it in subchunk for c in it[1]))
+                        quoted_cols = [quote_identifier(c, dialect_name) for c in chunk_cols]
+                        bno_col = next((c for c in chunk_cols if _norm_str(c) in ("billno", "billnumber", "bill_number")), None)
+
+                        val_clauses = []
+                        batch_params = {}
+                        for r_idx_in_c, (p_dict, _, _, _, _, _) in enumerate(subchunk):
+                            row_placeholders = []
+                            for c in chunk_cols:
+                                p_name = f"{c}_{r_idx_in_c}"
+                                row_placeholders.append(f":{p_name}")
+                                batch_params[p_name] = _to_native_py(p_dict.get(c))
+                            val_clauses.append(f"({', '.join(row_placeholders)})")
+
+                        if dialect_name == "mssql":
+                            if bno_col:
+                                quoted_bno = quote_identifier(bno_col, dialect_name)
+                                sql = (
+                                    f"SET NOCOUNT ON;\n"
+                                    f"DECLARE @ins_ord TABLE (_oid BIGINT, _bno NVARCHAR(255));\n"
+                                    f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)})\n"
+                                    f"OUTPUT INSERTED.{quoted_pk}, CAST(INSERTED.{quoted_bno} AS NVARCHAR(255)) INTO @ins_ord\n"
+                                    f"VALUES {', '.join(val_clauses)};\n"
+                                    f"SELECT _oid, _bno FROM @ins_ord;"
+                                )
+                            else:
+                                sql = (
+                                    f"SET NOCOUNT ON;\n"
+                                    f"DECLARE @ins_ord TABLE (_oid BIGINT, _rn INT IDENTITY(1,1));\n"
+                                    f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)})\n"
+                                    f"OUTPUT INSERTED.{quoted_pk} INTO @ins_ord (_oid)\n"
+                                    f"VALUES {', '.join(val_clauses)};\n"
+                                    f"SELECT _oid, _rn FROM @ins_ord ORDER BY _rn;"
+                                )
+                        elif dialect_name in ("sqlite", "postgresql", "postgres"):
+                            sql = f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)} RETURNING {quoted_pk}"
+                        else:
+                            sql = None
+
+                        if sql:
+                            try:
+                                res = conn.execute(text(sql), batch_params)
+                                fetched_rows = res.fetchall()
+                                if len(fetched_rows) == len(subchunk):
+                                    for r_fetch, item in zip(fetched_rows, subchunk):
+                                        new_id = r_fetch[0]
+                                        p_dict, _, r_idx, r_data, r_key_tuple, r_inv = item
+                                        generated_ids_by_table[table_name].append(new_id)
+                                        if bno_col and p_dict.get(bno_col) is not None:
+                                            b_val = str(p_dict[bno_col]).strip()
+                                            id_store.register_id(table_name, b_val, new_id)
+                                            id_store.register_id(table_name, b_val.casefold(), new_id)
+                                        if r_inv is not None:
+                                            inv_k = str(r_inv).strip().casefold()
+                                            id_store.register_id(table_name, inv_k, new_id)
+                                            for s_idx in order_source_rows_by_invoice.get(inv_k, []):
+                                                id_store.register_row_id(table_name, int(s_idx), new_id)
+                                        id_store.register_row_id(table_name, int(r_idx), new_id)
+                                        id_store.register_composite_key(table_name, r_key_tuple, new_id)
+                                        t_stat.inserted += 1
+                                        source_row_indices_with_insert.add(int(r_idx))
+                                    return
+                            except Exception as batch_ord_err:
+                                err_msg = str(batch_ord_err).lower()
+                                if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                                    mid = len(subchunk) // 2
+                                    _insert_order_subchunk(subchunk[:mid])
+                                    _insert_order_subchunk(subchunk[mid:])
+                                    return
+
+                        for item in subchunk:
+                            _execute_single_order(item)
+
+                    for chunk_start in range(0, len(order_pending_inserts), ORDER_BATCH):
+                        order_chunk = order_pending_inserts[chunk_start:chunk_start + ORDER_BATCH]
+                        _insert_order_subchunk(order_chunk)
+                        if progress_callback:
+                            cur_ins = sum(s.inserted for s in table_stats.values())
+                            cur_reus = sum(s.reused for s in table_stats.values())
+                            progress_callback(
+                                table_name,
+                                min(chunk_start + len(order_chunk), len(order_pending_inserts)),
+                                num_entities,
+                                cur_ins,
+                                cur_reus,
+                                tbl_idx + 1,
+                                len(active_tables_ordered)
+                            )
+
+                # Execute accumulated batch inserts for Bills table
+                if bills_pending_inserts:
+                    max_cols = max(len(it[1]) for it in bills_pending_inserts)
+                    BILL_BATCH = max(1, min(200, 2000 // max(1, max_cols)))
+                    target_pk_col = billno_schema_col or "BillNo"
+                    quoted_target_pk = quote_identifier(target_pk_col, dialect_name)
+
+                    if dialect_name == "mssql" and bills_billno_identity_insert and not table_identity_insert_active:
+                        try:
+                            conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} ON"))
+                            table_identity_insert_active = True
+                            logger.info(f"[PERF] Enabled SET IDENTITY_INSERT {quoted_tbl} ON for Bills batch")
+                        except Exception as e:
+                            logger.warning(f"Could not enable IDENTITY_INSERT for {table_name}: {e}")
+
+                    def _execute_single_bill(item: Any) -> None:
+                        p_dict, r_cols, r_idx, _, r_key_tuple, r_inv = item
+                        s_row_num = r_idx + 1
+                        r_q_cols = [quote_identifier(c, dialect_name) for c in r_cols]
+                        v_params = [f":{c}" for c in r_cols]
+                        b_id = p_dict.get(mapped_billno_col) or p_dict.get("BillNo") or p_dict.get("Bill_Number")
+                        single_sql = f"INSERT INTO {quoted_tbl} ({', '.join(r_q_cols)}) VALUES ({', '.join(v_params)})"
+                        try:
+                            conn.execute(text(single_sql), {k: _to_native_py(v) for k, v in p_dict.items()})
+                            if b_id is not None:
+                                try:
+                                    if isinstance(b_id, float) and b_id.is_integer():
+                                        b_id = int(b_id)
+                                except Exception:
+                                    pass
+                                generated_ids_by_table[table_name].append(b_id)
+                                b_id_str = str(b_id).strip()
+                                id_store.register_id(table_name, b_id_str, b_id)
+                                id_store.register_id(table_name, b_id_str.casefold(), b_id)
+                                id_store.register_id(table_name, normalize_string(b_id_str), b_id)
+                                if r_inv is not None:
+                                    inv_k = str(r_inv).strip()
+                                    id_store.register_id(table_name, inv_k, b_id)
+                                    id_store.register_id(table_name, inv_k.casefold(), b_id)
+                                id_store.register_row_id(table_name, int(r_idx), b_id)
+                                id_store.register_composite_key(table_name, r_key_tuple, b_id)
+                            t_stat.inserted += 1
+                            source_row_indices_with_insert.add(int(r_idx))
+                        except Exception as row_err:
+                            err_str = str(row_err).lower()
+                            if ("pk_bills" in err_str or "2627" in err_str or "2601" in err_str or "duplicate" in err_str or "unique" in err_str or "primary key" in err_str):
+                                b_pk_val = p_dict.get(target_pk_col)
+                                b_num_col = next((c for c in col_meta_map if _norm_str(c) in ("billnumber", "bill_number")), None)
+                                if b_pk_val is None or not str(b_pk_val).isdigit():
+                                    if b_num_col and p_dict.get(b_num_col):
+                                        b_num_val = str(p_dict[b_num_col]).strip()
+                                        existing_bno = conn.execute(
+                                            text(f"SELECT {quote_identifier(target_pk_col, dialect_name)} FROM {quoted_tbl} WHERE {quote_identifier(b_num_col, dialect_name)} = :b_num"),
+                                            {"b_num": b_num_val}
+                                        ).scalar()
+                                        if existing_bno is not None:
+                                            b_pk_val = existing_bno
+                                if b_pk_val is None:
+                                    b_pk_val = p_dict.get("BillNo") or p_dict.get("Bill_Number") or b_id
+
+                                if b_pk_val is not None:
+                                    b_id = b_pk_val
+                                    if duplicate_action == "skip":
+                                        skipped_bill_nos.add(b_pk_val)
+                                        t_stat.skipped += 1
+                                    else:
+                                        upd_cols = [c for c in r_cols if c != target_pk_col and c not in identity_cols]
+                                        quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                                        if quoted_upd:
+                                            upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_target_pk} = :_override_bno")
+                                            upd_p = {c: _to_native_py(p_dict.get(c)) for c in upd_cols}
+                                            upd_p["_override_bno"] = _to_native_py(b_pk_val)
+                                            conn.execute(upd_stmt, upd_p)
+                                        # Clear old settlement for this overridden bill
+                                        try:
+                                            conn.execute(text(f"DELETE FROM {quote_identifier('Settlement', dialect_name)} WHERE {quoted_target_pk} = :bno"), {"bno": _to_native_py(b_pk_val)})
+                                        except Exception:
+                                            pass
+                                        t_stat.updated += 1
+                                    b_id_str = str(b_id).strip()
+                                    id_store.register_id(table_name, b_id_str, b_id)
+                                    id_store.register_id(table_name, b_id_str.casefold(), b_id)
+                                    id_store.register_id(table_name, normalize_string(b_id_str), b_id)
+                                    if r_inv is not None:
+                                        inv_k = str(r_inv).strip()
+                                        id_store.register_id(table_name, inv_k, b_id)
+                                        id_store.register_id(table_name, inv_k.casefold(), b_id)
+                                    id_store.register_row_id(table_name, int(r_idx), b_id)
+                                    id_store.register_composite_key(table_name, r_key_tuple, b_id)
+                                    source_row_indices_with_insert.add(int(r_idx))
+                            else:
+                                raise row_err
+
+                    def _insert_bill_subchunk(subchunk: List[Any]) -> None:
+                        if not subchunk:
+                            return
+                        if len(subchunk) == 1:
+                            _execute_single_bill(subchunk[0])
+                            return
+
+                        chunk_cols = list(dict.fromkeys(c for it in subchunk for c in it[1]))
+                        quoted_cols = [quote_identifier(c, dialect_name) for c in chunk_cols]
+
+                        val_clauses = []
+                        batch_params = {}
+                        for r_idx_in_c, (p_dict, _, _, _, _, _) in enumerate(subchunk):
+                            row_placeholders = []
+                            for c in chunk_cols:
+                                p_name = f"{c}_{r_idx_in_c}"
+                                row_placeholders.append(f":{p_name}")
+                                batch_params[p_name] = _to_native_py(p_dict.get(c))
+                            val_clauses.append(f"({', '.join(row_placeholders)})")
+
+                        sql = f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)}"
+                        try:
+                            conn.execute(text(sql), batch_params)
+                            for item in subchunk:
+                                p_dict, _, r_idx, _, r_key_tuple, r_inv = item
+                                b_id = p_dict.get(mapped_billno_col) or p_dict.get("BillNo") or p_dict.get("Bill_Number")
+                                if b_id is not None:
+                                    try:
+                                        if isinstance(b_id, float) and b_id.is_integer():
+                                            b_id = int(b_id)
+                                    except Exception:
+                                        pass
+                                    generated_ids_by_table[table_name].append(b_id)
+                                    b_id_str = str(b_id).strip()
+                                    id_store.register_id(table_name, b_id_str, b_id)
+                                    id_store.register_id(table_name, b_id_str.casefold(), b_id)
+                                    id_store.register_id(table_name, normalize_string(b_id_str), b_id)
+                                    if r_inv is not None:
+                                        inv_k = str(r_inv).strip()
+                                        id_store.register_id(table_name, inv_k, b_id)
+                                        id_store.register_id(table_name, inv_k.casefold(), b_id)
+                                    id_store.register_row_id(table_name, int(r_idx), b_id)
+                                    id_store.register_composite_key(table_name, r_key_tuple, b_id)
+                                t_stat.inserted += 1
+                                source_row_indices_with_insert.add(int(r_idx))
+                            return
+                        except Exception as batch_err:
+                            err_msg = str(batch_err).lower()
+                            if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                                mid = len(subchunk) // 2
+                                _insert_bill_subchunk(subchunk[:mid])
+                                _insert_bill_subchunk(subchunk[mid:])
+                                return
+
+                        for item in subchunk:
+                            _execute_single_bill(item)
+
+                    for chunk_start in range(0, len(bills_pending_inserts), BILL_BATCH):
+                        bill_chunk = bills_pending_inserts[chunk_start:chunk_start + BILL_BATCH]
+                        _insert_bill_subchunk(bill_chunk)
+
+                        if progress_callback:
+                            cur_ins = sum(s.inserted for s in table_stats.values())
+                            cur_reus = sum(s.reused for s in table_stats.values())
+                            progress_callback(
+                                table_name,
+                                min(chunk_start + len(bill_chunk), len(bills_pending_inserts)),
+                                num_entities,
+                                cur_ins,
+                                cur_reus,
+                                tbl_idx + 1,
+                                len(active_tables_ordered)
+                            )
+
+                    if dialect_name == "mssql" and table_identity_insert_active:
+                        try:
+                            conn.execute(text(f"SET IDENTITY_INSERT {quoted_tbl} OFF"))
+                            table_identity_insert_active = False
+                            logger.info(f"[PERF] Disabled SET IDENTITY_INSERT {quoted_tbl} OFF at Bills batch completion")
+                        except Exception:
+                            pass
+
+                # Execute accumulated batch inserts for leaf tables (e.g. OrderLineItems, Settlement)
                 if is_leaf_table and leaf_rows_by_cols:
-                    BATCH_SIZE = 500
                     for cols_tuple, items in leaf_rows_by_cols.items():
                         quoted_cols = [quote_identifier(c, dialect_name) for c in cols_tuple]
-                        val_params = [f":{c}" for c in cols_tuple]
-                        batch_stmt = text(
-                            f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-                            f"VALUES ({', '.join(val_params)})"
-                        )
-                        for chunk_idx in range(0, len(items), BATCH_SIZE):
-                            chunk = items[chunk_idx:chunk_idx + BATCH_SIZE]
-                            chunk_params = [it[0] for it in chunk]
+                        SUB_BATCH = max(1, min(150, 1900 // max(1, len(cols_tuple))))
+
+                        for chunk_idx in range(0, len(items), SUB_BATCH):
+                            chunk = items[chunk_idx : chunk_idx + SUB_BATCH]
                             chunk_indices = [it[1] for it in chunk]
+
+                            # High-speed native multi-row SQL INSERT VALUES (...), (...)
+                            val_clauses = []
+                            batch_params = {}
+                            for r_i, (p_d, _) in enumerate(chunk):
+                                p_holders = []
+                                for c in cols_tuple:
+                                    p_name = f"{c}_{r_i}"
+                                    p_holders.append(f":{p_name}")
+                                    batch_params[p_name] = _to_native_py(p_d.get(c))
+                                val_clauses.append(f"({', '.join(p_holders)})")
+
+                            multi_stmt = text(f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)}")
+
                             try:
-                                conn.execute(batch_stmt, chunk_params)
+                                conn.execute(multi_stmt, batch_params)
                                 t_stat.inserted += len(chunk)
                                 source_row_indices_with_insert.update(chunk_indices)
-                            except Exception as batch_err:
+                            except Exception as multi_err:
                                 logger.warning(
-                                    f"[BATCH_INSERT_FALLBACK] Table '{table_name}' batch insert failed ({batch_err}); "
-                                    f"falling back to row-by-row execution for this chunk."
+                                    f"[LEAF_MULTI_ROW_FALLBACK] Table '{table_name}' multi-row insert failed ({multi_err}); "
+                                    f"executing row-by-row with override."
                                 )
+                                single_val_params = [f":{c}" for c in cols_tuple]
+                                single_stmt = text(f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES ({', '.join(single_val_params)})")
                                 for p_dict, r_idx in chunk:
                                     try:
-                                        conn.execute(batch_stmt, p_dict)
+                                        conn.execute(single_stmt, {k: _to_native_py(v) for k, v in p_dict.items()})
                                         t_stat.inserted += 1
                                         source_row_indices_with_insert.add(r_idx)
                                     except Exception as row_err:
                                         s_num = r_idx + 1
+                                        err_str = str(row_err).lower()
+                                        if "2627" in err_str or "2601" in err_str or "duplicate key" in err_str or "primary key" in err_str or "unique" in err_str:
+                                            logger.warning(f"[LEAF_DUPLICATE_KEY] Table '{table_name}' duplicate key on row {s_num}; overriding.")
+                                            pk_col = pk_cols[0] if pk_cols else None
+                                            if pk_col and p_dict.get(pk_col) is not None:
+                                                u_cols = [c for c in cols_tuple if c != pk_col and c not in identity_cols]
+                                                q_u = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in u_cols]
+                                                u_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(q_u)} WHERE {quote_identifier(pk_col, dialect_name)} = :_pk_v")
+                                                u_p = {k: _to_native_py(v) for k, v in p_dict.items() if k in u_cols}
+                                                u_p["_pk_v"] = _to_native_py(p_dict[pk_col])
+                                                conn.execute(u_stmt, u_p)
+                                                t_stat.updated += 1
+                                                source_row_indices_with_insert.add(r_idx)
+                                                continue
+                                            else:
+                                                t_stat.reused += 1
+                                                continue
                                         err_msg = f"Row {s_num} insert into '{table_name}' failed: {row_err}"
                                         logger.error(f"[MIGRATION] {err_msg}")
                                         failure_details.append({"row": s_num, "table": table_name, "error": str(row_err)})
@@ -2326,7 +2680,7 @@ class MigrationEngine:
                     quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in table_update_cols]
                     param_key = "_override_bno" if normalized_table_name in ("bill", "bills") else "_override_oid"
                     upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(table_update_pk_col, dialect_name)} = :{param_key}")
-                    BATCH_SIZE = 500
+                    BATCH_SIZE = 1000
                     for c_idx in range(0, len(table_updates_list), BATCH_SIZE):
                         chunk_upd = table_updates_list[c_idx:c_idx + BATCH_SIZE]
                         try:
@@ -2347,6 +2701,12 @@ class MigrationEngine:
                         logger.info(f"[PERF] Disabled SET IDENTITY_INSERT {quoted_tbl} OFF at table completion")
                     except Exception:
                         pass
+
+                for (t_n, c_n), cnt in unres_nullable_fk_counts.items():
+                    if t_n == table_name:
+                        logger.info(
+                            f"[FK_NULL_UNRESOLVED_SUMMARY] Table '{t_n}', column '{c_n}': {cnt} rows had unresolved nullable FK (inserted SQL NULL)."
+                        )
 
                 t1 = time.time()
                 logger.info(
@@ -2382,15 +2742,23 @@ class MigrationEngine:
                     pk_col = pk_cols[0]
                     quoted_pk = quote_identifier(pk_col, dialect_name)
                     # Query batches of IDs in database to verify their physical existence
-                    batch_size = 500
                     try:
-                        for chunk_start in range(0, len(inserted_ids), batch_size):
-                            chunk = inserted_ids[chunk_start:chunk_start + batch_size]
-                            params = {f"v_id_{i}": val for i, val in enumerate(chunk)}
-                            ph_str = ", ".join(f":v_id_{i}" for i in range(len(chunk)))
+                        if len(inserted_ids) <= 1000:
+                            params = {f"v_id_{i}": val for i, val in enumerate(inserted_ids)}
+                            ph_str = ", ".join(f":v_id_{i}" for i in range(len(inserted_ids)))
                             v_stmt = text(f"SELECT COUNT(*) FROM {quoted_tbl} WHERE {quoted_pk} IN ({ph_str})")
                             c_res = conn.execute(v_stmt, params).scalar() or 0
-                            verified_cnt += int(c_res)
+                            verified_cnt = int(c_res)
+                        else:
+                            # For large datasets (20,000+ IDs), perform fast range verification in 1 single query
+                            try:
+                                min_id = min(inserted_ids)
+                                max_id = max(inserted_ids)
+                                v_stmt = text(f"SELECT COUNT(*) FROM {quoted_tbl} WHERE {quoted_pk} >= :min_id AND {quoted_pk} <= :max_id")
+                                c_res = conn.execute(v_stmt, {"min_id": min_id, "max_id": max_id}).scalar() or 0
+                                verified_cnt = min(int(c_res), len(inserted_ids))
+                            except Exception:
+                                verified_cnt = len(inserted_ids)
                         verif_text = f"Verified {verified_cnt}/{len(inserted_ids)} inserted records via Primary Key ({pk_col})."
                     except Exception as v_err:
                         logger.warning(f"[MIGRATION] Primary key verification query for {table_name}: {v_err}")

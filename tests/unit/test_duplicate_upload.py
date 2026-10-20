@@ -197,15 +197,11 @@ def test_bills_duplicate_override_mssql():
         executed_statements.append(sql_str)
         executed_params.append(params)
         res = MagicMock()
-        # Prefetch returns existing bill 1057510
-        if "FROM [Bills]" in sql_str and "SELECT" in sql_str:
-            res.mappings.return_value.all.return_value = [
-                {"Bill_Number": "1057510", "BillNo": 1057510, "Order_ID": None}
-            ]
-            res.fetchall.return_value = [(1057510, "1057510")]
-        else:
-            res.mappings.return_value.all.return_value = []
-            res.fetchall.return_value = []
+        if "INSERT INTO [Bills]" in sql_str:
+            # Simulate SQL Server duplicate PK error on explicit BillNo insert
+            raise Exception("Violation of PRIMARY KEY constraint 'PK_Bills'. Cannot insert duplicate key in object 'dbo.Bills'. The duplicate key value is (1057510).")
+        res.mappings.return_value.all.return_value = []
+        res.fetchall.return_value = []
         res.rowcount = 1
         res.scalar.return_value = 1
         return res

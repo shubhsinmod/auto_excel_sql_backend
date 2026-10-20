@@ -85,8 +85,8 @@ def test_duplicate_action_skip_invoices_integration():
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE Outlets (Outlet_ID INTEGER PRIMARY KEY, Outlet_Name TEXT)"))
         conn.execute(text("INSERT INTO Outlets VALUES (1, 'Main Branch')"))
-        conn.execute(text("CREATE TABLE Bills (BillNo INTEGER PRIMARY KEY, Bill_Number TEXT, Total REAL, Outlet_ID INTEGER)"))
-        conn.execute(text("CREATE TABLE [Order] (Order_ID INTEGER PRIMARY KEY, BillNo INTEGER, Invoice_No TEXT, Outlet_ID INTEGER)"))
+        conn.execute(text("CREATE TABLE Bills (BillNo INTEGER PRIMARY KEY, Bill_Number TEXT UNIQUE, Total REAL, Outlet_ID INTEGER)"))
+        conn.execute(text("CREATE TABLE [Order] (Order_ID INTEGER PRIMARY KEY, BillNo INTEGER, Invoice_No TEXT UNIQUE, Outlet_ID INTEGER)"))
         conn.execute(text("CREATE TABLE OrderLineItems (LineItem_ID INTEGER PRIMARY KEY, Order_ID INTEGER, Item_Name TEXT, Quantity INTEGER)"))
         conn.execute(text("CREATE TABLE Settlement (Settlement_ID INTEGER PRIMARY KEY, BillNo INTEGER, Cash REAL)"))
 
@@ -220,8 +220,8 @@ def test_duplicate_action_override_invoices_integration():
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE Outlets (Outlet_ID INTEGER PRIMARY KEY, Outlet_Name TEXT)"))
         conn.execute(text("INSERT INTO Outlets VALUES (1, 'Main Branch')"))
-        conn.execute(text("CREATE TABLE Bills (BillNo INTEGER PRIMARY KEY, Bill_Number TEXT, Total REAL, Outlet_ID INTEGER)"))
-        conn.execute(text("CREATE TABLE [Order] (Order_ID INTEGER PRIMARY KEY, BillNo INTEGER, Invoice_No TEXT, Outlet_ID INTEGER)"))
+        conn.execute(text("CREATE TABLE Bills (BillNo INTEGER PRIMARY KEY, Bill_Number TEXT UNIQUE, Total REAL, Outlet_ID INTEGER)"))
+        conn.execute(text("CREATE TABLE [Order] (Order_ID INTEGER PRIMARY KEY, BillNo INTEGER, Invoice_No TEXT UNIQUE, Outlet_ID INTEGER)"))
         conn.execute(text("CREATE TABLE OrderLineItems (LineItem_ID INTEGER PRIMARY KEY, Order_ID INTEGER, Item_Name TEXT, Quantity INTEGER)"))
         conn.execute(text("CREATE TABLE Settlement (Settlement_ID INTEGER PRIMARY KEY, BillNo INTEGER, Cash REAL)"))
 
@@ -394,5 +394,109 @@ def test_transactional_rollback_on_failure():
     with engine.connect() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM Bills")).scalar_one()
         assert count == 0
+
+
+def test_customer_batch_migration_performance_and_id_propagation():
+    """Verify that Customer table migration processes in batch chunks with high performance and exact ID propagation."""
+    import time
+    from sqlalchemy import create_engine, text
+    import pandas as pd
+    from app.models.schema import ColumnMetadata, TableMetadata, DatabaseSchemaMetadata, ForeignKeyInfo
+    from app.models.migration import ColumnMappingResult
+    from app.migration.engine import MigrationEngine
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE Customer (
+                Customer_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                Customer_Name VARCHAR(100),
+                Mobile_Number VARCHAR(20)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE "Order" (
+                Order_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                Order_Number VARCHAR(50),
+                Customer_ID INTEGER
+            )
+        """))
+
+    customer_tbl = TableMetadata(
+        name="Customer",
+        schema_name="dbo",
+        columns=[
+            ColumnMetadata(name="Customer_ID", type="INT", nullable=False, primary_key=True, identity=True),
+            ColumnMetadata(name="Customer_Name", type="VARCHAR", nullable=False),
+            ColumnMetadata(name="Mobile_Number", type="VARCHAR", nullable=True),
+        ],
+        primary_keys=["Customer_ID"],
+        foreign_keys=[]
+    )
+    order_tbl = TableMetadata(
+        name="Order",
+        schema_name="dbo",
+        columns=[
+            ColumnMetadata(name="Order_ID", type="INT", nullable=False, primary_key=True, identity=True),
+            ColumnMetadata(name="Order_Number", type="VARCHAR", nullable=False),
+            ColumnMetadata(name="Customer_ID", type="INT", nullable=True),
+        ],
+        primary_keys=["Order_ID"],
+        foreign_keys=[
+            ForeignKeyInfo(constrained_column="Customer_ID", target_table="Customer", target_column="Customer_ID")
+        ]
+    )
+    schema_metadata = DatabaseSchemaMetadata(
+        database_name="POS_DB",
+        db_type="sqlite",
+        tables=[customer_tbl, order_tbl]
+    )
+
+    # 1000 rows total: 200 distinct customers repeated 5 times each
+    rows = []
+    for i in range(1000):
+        c_num = i % 200
+        rows.append({
+            "cust_name": f"Customer_{c_num}",
+            "mobile": f"980000{c_num:04d}",
+            "order_no": f"ORD-{i:04d}"
+        })
+    df = pd.DataFrame(rows)
+
+    mappings = [
+        ColumnMappingResult(excelColumn="cust_name", databaseTable="Customer", databaseColumn="Customer_Name", status="MATCHED"),
+        ColumnMappingResult(excelColumn="mobile", databaseTable="Customer", databaseColumn="Mobile_Number", status="MATCHED"),
+        ColumnMappingResult(excelColumn="order_no", databaseTable="Order", databaseColumn="Order_Number", status="MATCHED"),
+    ]
+
+    upload_id = "upload_perf_customers_1000"
+    t0 = time.time()
+    with patch("app.services.excel_service.excel_service.get_upload_session") as mock_session, \
+         patch("app.migration.engine.get_engine", return_value=engine), \
+         patch("app.services.database_service.database_service.get_schema_metadata", return_value=schema_metadata), \
+         patch("app.migration.engine.load_file_dataframe", return_value=df), \
+         patch("app.migration.engine.pd.io.common.file_exists", return_value=True), \
+         patch("app.mapping.matcher.ColumnMatcher.match_columns", return_value=mappings), \
+         patch("os.path.exists", return_value=True):
+        mock_session.return_value = {"filePath": "dummy.xlsx", "sheetName": None, "headerRowNumber": 1}
+        res = MigrationEngine.execute_migration(upload_id)
+    elapsed = time.time() - t0
+
+    assert res.status == "COMPLETED"
+    assert elapsed < 3.0  # Must finish fast in batch mode
+    cust_stat = res.tables["Customer"]
+    assert cust_stat.inserted == 200
+    assert cust_stat.reused == 800
+
+    with engine.connect() as conn:
+        db_cust_count = conn.execute(text("SELECT COUNT(*) FROM Customer")).scalar()
+        assert db_cust_count == 200
+
+        # Verify that all 1000 orders have a non-null Customer_ID assigned
+        orders = conn.execute(text("SELECT Order_Number, Customer_ID FROM \"Order\"")).fetchall()
+        assert len(orders) == 1000
+        for o_num, cid in orders:
+            assert cid is not None
+
 
 
