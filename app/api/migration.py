@@ -126,15 +126,18 @@ def validate_dataset(upload_id: str):
 
 
 @router.post("/start/{upload_id}", response_model=MigrationJobStatus)
-def start_migration(upload_id: str):
+def start_migration(
+    upload_id: str,
+    duplicate_action: str = Query("override", alias="duplicateAction")
+):
     """
     Starts asynchronous database migration in background worker thread and promptly returns job status.
     Safe against concurrent duplicate clicks or reloads.
     """
     t0 = time.time()
-    logger.info(f"[API] START MIGRATION HANDLER | POST /api/migration/start/{upload_id}")
+    logger.info(f"[API] START MIGRATION HANDLER | POST /api/migration/start/{upload_id} | action={duplicate_action}")
     try:
-        job = migration_service.start_migration(upload_id)
+        job = migration_service.start_migration(upload_id, duplicate_action=duplicate_action)
         t1 = time.time()
         logger.info(f"[API] START MIGRATION HANDLER END | status={job.status} | {t1 - t0:.3f}s")
         return job
@@ -200,14 +203,17 @@ def reconcile_migration(upload_id: str):
 
 
 @router.post("/execute/{upload_id}", response_model=MigrationExecutionResponse)
-def execute_migration(upload_id: str):
+def execute_migration(
+    upload_id: str,
+    duplicate_action: str = Query("override", alias="duplicateAction")
+):
     """
     Executes actual parameterized SQL database migration for an uploaded Excel session inside a single atomic transaction.
     """
     t0 = time.time()
-    logger.info(f"[API] EXECUTE HANDLER START | POST /api/migration/execute/{upload_id}")
+    logger.info(f"[API] EXECUTE HANDLER START | POST /api/migration/execute/{upload_id} | action={duplicate_action}")
     try:
-        result = migration_service.execute_migration(upload_id)
+        result = migration_service.execute_migration(upload_id, duplicate_action=duplicate_action)
         t1 = time.time()
         logger.info(f"[API] EXECUTE HANDLER END | {t1 - t0:.3f}s")
         return result

@@ -3,7 +3,11 @@ import base64
 import hashlib
 import hmac
 import re
-import bcrypt
+
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -32,6 +36,9 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
     # Supabase bcrypt hashes: $2a$, $2b$, or $2y$
     if stored_hash.startswith(("$2a$", "$2b$", "$2y$")):
+        if bcrypt is None:
+            logger.error("[AUTH] bcrypt module is not installed to verify bcrypt password hash")
+            return False
         try:
             return bcrypt.checkpw(
                 password.encode("utf-8"),

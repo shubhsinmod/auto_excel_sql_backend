@@ -210,6 +210,23 @@ _engine: Engine | None = None
 _SessionLocal: sessionmaker | None = None
 
 
+def _create_engine_options(database_url: str) -> dict:
+    """Common pooling options; enable fast_executemany only for MSSQL+pyodbc."""
+    options = {
+        "pool_pre_ping": True,
+        "pool_size": 10,
+        "max_overflow": 20,
+        "pool_timeout": 30,
+        "pool_recycle": 1800,
+        "echo": False,
+    }
+    # SQLAlchemy's fast_executemany is supported by the mssql+pyodbc dialect.
+    # It benefits executemany/bulk parameter calls, not single-row INSERT calls.
+    if str(database_url).lower().startswith("mssql+pyodbc://"):
+        options["fast_executemany"] = True
+    return options
+
+
 def auto_create_database(active_settings) -> bool:
     """
     Attempts to automatically create the database on the target server if it does not exist.
@@ -256,10 +273,7 @@ def get_engine(override_settings=None) -> Engine:
         logger.info(f"[DB] create_engine (temporary) START | URL: {active_settings.database_url}")
         engine = create_engine(
             active_settings.database_url,
-            pool_pre_ping=True,
-            pool_size=10,
-            max_overflow=20,
-            echo=False
+            **_create_engine_options(active_settings.database_url)
         )
         t1 = time.time()
         logger.info(f"[DB] create_engine (temporary) END | {t1 - t0:.3f}s")
@@ -270,10 +284,7 @@ def get_engine(override_settings=None) -> Engine:
         logger.info(f"[DB] create_engine START | DB_TYPE={active_settings.DB_TYPE}, DB_NAME={active_settings.DB_NAME}")
         _engine = create_engine(
             active_settings.database_url,
-            pool_pre_ping=True,
-            pool_size=10,
-            max_overflow=20,
-            echo=False
+            **_create_engine_options(active_settings.database_url)
         )
         t1 = time.time()
         logger.info(f"[DB] create_engine END | {t1 - t0:.3f}s")
