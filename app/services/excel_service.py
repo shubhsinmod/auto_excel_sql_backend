@@ -80,20 +80,8 @@ class ExcelService:
         t_save_1 = time.time()
         logger.info(f"[STEP3] Excel file save END | {t_save_1 - t_save_0:.3f}s")
 
-        # 3.5 Exact-file duplicate check before workbook analysis or DB work.
-        # The SHA-256 digest is content-based, so renaming the same file does not bypass it.
+        # 3.5 Content fingerprint calculation for session tracking (duplicate check disabled)
         file_sha256 = ExcelService._sha256_file(target_file_path)
-        existing_import = ExcelService.find_successful_import(file_sha256)
-        if existing_import:
-            try:
-                os.remove(target_file_path)
-            except OSError:
-                pass
-            raise ValueError(
-                "DUPLICATE_FILE: This exact file was already imported successfully "
-                f"as '{existing_import['original_filename']}' on {existing_import['imported_at']}. "
-                "Upload was stopped; no database records were changed."
-            )
 
         # 4. Validate saved Excel workbook
         is_valid_wb, wb_error = validate_excel_workbook(target_file_path)

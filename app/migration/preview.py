@@ -86,14 +86,20 @@ def classify_table_relevance(
         "orderlineitem", "orderlineitems",
         "settlement", "settlements",
     }
-    if compact_table in read_only_lookup_tables or compact_table.endswith("itemsmaster"):
-        return TableRole.LOOKUP_ONLY, "Approved read-only lookup table; never insert/update/delete master records"
-    if compact_table not in writable_table_aliases:
-        return TableRole.SKIP, (
-            "Insufficient entity representation for this migration scope. Excluded by explicit migration scope: "
-            "writes are allowed only to Customer, Bill(s), Order(s), OrderLineItems, and Settlement(s); "
-            "Outlets and ItemsMaster are lookup-only"
-        )
+    all_schema_table_keys = {
+        str(t.name).lower().replace("dbo.", "").replace("_", "").replace(" ", "").strip()
+        for t in schema.tables
+    }
+    has_restaurant_schema = bool(all_schema_table_keys & (read_only_lookup_tables | writable_table_aliases))
+    if has_restaurant_schema:
+        if compact_table in read_only_lookup_tables or compact_table.endswith("itemsmaster"):
+            return TableRole.LOOKUP_ONLY, "Approved read-only lookup table; never insert/update/delete master records"
+        if compact_table not in writable_table_aliases:
+            return TableRole.SKIP, (
+                "Insufficient entity representation for this migration scope. Excluded by explicit migration scope: "
+                "writes are allowed only to Customer, Bill(s), Order(s), OrderLineItems, and Settlement(s); "
+                "Outlets and ItemsMaster are lookup-only"
+            )
 
     # Only consider MATCHED mappings
     valid_mappings = [m for m in mappings if m.status == "MATCHED"]

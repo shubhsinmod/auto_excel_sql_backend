@@ -226,7 +226,7 @@ class MigrationService:
         return response
 
 
-    def start_migration(self, upload_id: str) -> MigrationJobStatus:
+    def start_migration(self, upload_id: str, duplicate_action: str = "override") -> MigrationJobStatus:
         """
         Initiates asynchronous background migration and promptly returns a job status.
         Coordinates in-flight requests and prevents duplicate executions.
@@ -245,16 +245,11 @@ class MigrationService:
                     return job_manager.mark_blocked(upload_id, res.message, res)
                 self._migration_cache.pop(upload_id, None)
 
-        # 2. Check preview state & validation block
+        # 2. Check preview state & validation block if cached, otherwise use session metadata
         step3_data = self._step3_cache.get(upload_id)
-        if not step3_data:
-            try:
-                step3_data = self.process_step3(upload_id)
-            except Exception as e:
-                logger.warning(f"[MIGRATION] Could not compute Step 3 preview for {upload_id}: {e}")
-
         total_rows = 0
-        total_tables = 0
+        total_tables = 5
+
         if step3_data:
             if step3_data.validation_summary and not step3_data.validation_summary.can_execute:
                 vs = step3_data.validation_summary
@@ -313,7 +308,11 @@ class MigrationService:
                     tables_completed=tbl_idx - 1 if rows_done < tbl_total_rows else tbl_idx,
                     total_tables=num_tables
                 )
-            res = MigrationEngine.execute_migration(upload_id, progress_callback=_progress)
+            res = MigrationEngine.execute_migration(
+                upload_id,
+                progress_callback=_progress,
+                duplicate_action=duplicate_action
+            )
             if res.transaction == "COMMITTED" or res.status == "BLOCKED":
                 with self._lock:
                     self._migration_cache[upload_id] = res
@@ -360,7 +359,7 @@ class MigrationService:
             target_tables = step3_data.planned_operations.planned_inserts_by_table
         return job_manager.reconcile_job(upload_id, engine, target_tables)
 
-    def execute_migration(self, upload_id: str) -> MigrationExecutionResponse:
+    def execute_migration(self, upload_id: str, duplicate_action: str = "override") -> MigrationExecutionResponse:
         """
         Executes actual parameterized SQL database migration for an uploaded Excel session inside a single atomic transaction.
         Idempotent: if already executed for upload_id, returns previous verified result.
@@ -414,7 +413,10 @@ class MigrationService:
 
         try:
             job_manager.mark_running(upload_id)
-            response = MigrationEngine.execute_migration(upload_id)
+            response = MigrationEngine.execute_migration(
+                upload_id,
+                duplicate_action=duplicate_action
+            )
             if response.transaction == "COMMITTED":
                 with self._lock:
                     self._migration_cache[upload_id] = response

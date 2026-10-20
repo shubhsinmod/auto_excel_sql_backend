@@ -43,18 +43,35 @@ def _extract_mssql_catalog_metadata(engine: Engine) -> DatabaseSchemaMetadata:
     db_type = "mssql"
 
     with engine.connect() as conn:
-        # 1. Fetch all user tables and schemas
+        # 1. Fetch all user tables and schemas (excluding Item_Combo_Definations)
         tables_sql = text("""
             SELECT s.name AS schema_name, t.name AS table_name
             FROM sys.tables t
             INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
             WHERE t.is_ms_shipped = 0
+              AND LOWER(REPLACE(REPLACE(t.name, '_', ''), ' ', '')) NOT LIKE '%itemcombodefination%'
             ORDER BY s.name, t.name
         """)
         table_rows = conn.execute(tables_sql).mappings().all()
 
         if not table_rows:
             return DatabaseSchemaMetadata(database_name=db_name, db_type=db_type, tables=[])
+
+        # Restrict introspection to required restaurant tables if present, preserving real table names
+        REQUIRED_PATTERNS = {
+            "customer", "customers", "bill", "bills", "order", "orders",
+            "orderlineitem", "orderlineitems", "settlement", "settlements",
+            "outlets", "outlet", "itemsmaster", "itemmaster"
+        }
+        all_keys = {
+            "".join(ch for ch in str(r["table_name"]).lower() if ch.isalnum())
+            for r in table_rows
+        }
+        if any(k in REQUIRED_PATTERNS for k in all_keys):
+            table_rows = [
+                r for r in table_rows
+                if "".join(ch for ch in str(r["table_name"]).lower() if ch.isalnum()) in REQUIRED_PATTERNS
+            ]
 
         # 2. Fetch all columns with types, nullability, identity, defaults, lengths
         columns_sql = text("""
@@ -197,6 +214,23 @@ def _extract_inspector_metadata(engine: Engine) -> DatabaseSchemaMetadata:
     db_type = engine.name
 
     table_names = inspector.get_table_names()
+    # Exclude Item_Combo_Definations
+    table_names = [
+        t for t in table_names
+        if "itemcombodefination" not in "".join(ch for ch in t.lower() if ch.isalnum())
+    ]
+    REQUIRED_PATTERNS = {
+        "customer", "customers", "bill", "bills", "order", "orders",
+        "orderlineitem", "orderlineitems", "settlement", "settlements",
+        "outlets", "outlet", "itemsmaster", "itemmaster"
+    }
+    all_keys = {"".join(ch for ch in t.lower() if ch.isalnum()) for t in table_names}
+    if any(k in REQUIRED_PATTERNS for k in all_keys):
+        table_names = [
+            t for t in table_names
+            if "".join(ch for ch in t.lower() if ch.isalnum()) in REQUIRED_PATTERNS
+        ]
+
     tables_metadata: List[TableMetadata] = []
     default_schema = "public" if db_type in ("postgresql", "postgres") else ("dbo" if db_type == "mssql" else "public")
 

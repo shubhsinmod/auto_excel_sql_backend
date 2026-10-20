@@ -438,33 +438,63 @@ def process_customer_migration(
         if date_modify_db_col:
             param_dict[date_modify_db_col] = None
 
+    # Collect repeat-visit updates and send them to SQL Server in one executemany
+    # operation instead of one UPDATE round-trip for every matched Excel row.
+    pending_repeat_dates: Dict[Any, Any] = {}
+
+    def _date_sort_key(value: Any) -> Any:
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                return None
+            return parsed.to_pydatetime()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     def update_repeat_visit_date(customer_id: Any, row_dict: Dict[str, Any]) -> None:
         visit_date = get_visit_date(row_dict)
-        if not date_modify_db_col or visit_date is None:
+        if not date_modify_db_col or visit_date is None or customer_id is None:
             return
         clean_date = sanitize_customer_date(date_modify_db_col, visit_date)
+        if clean_date is None:
+            return
+        previous = pending_repeat_dates.get(customer_id)
+        if previous is None:
+            pending_repeat_dates[customer_id] = clean_date
+            return
+        new_key = _date_sort_key(clean_date)
+        old_key = _date_sort_key(previous)
+        if new_key is not None and (old_key is None or new_key > old_key):
+            pending_repeat_dates[customer_id] = clean_date
+
+    def flush_repeat_visit_dates() -> None:
+        if not pending_repeat_dates or not date_modify_db_col:
+            return
         quoted_modify = quote_identifier(date_modify_db_col, dialect_name)
         quoted_pk_local = quote_identifier(pk_col, dialect_name)
         date_added_condition = ""
-        params = {"visit_date": clean_date, "customer_id": customer_id}
         if date_added_db_col:
             quoted_added = quote_identifier(date_added_db_col, dialect_name)
-            # Only mark a repeat visit when its timestamp is later than the original visit.
-            # This prevents Date_Modified from being set equal to Date_Added on insertion/same visit.
+            # Keep the original rule: Date_Modified only advances for visits later
+            # than Date_Added and never overwrites a newer Date_Modified.
             date_added_condition = f" AND {quoted_added} IS NOT NULL AND {quoted_added} < :visit_date"
-        conn.execute(
-            text(
-                f"UPDATE {quoted_tbl} SET {quoted_modify} = :visit_date "
-                f"WHERE {quoted_pk_local} = :customer_id "
-                f"AND ({quoted_modify} IS NULL OR {quoted_modify} < :visit_date)"
-                f"{date_added_condition}"
-            ),
-            params
+        update_stmt = text(
+            f"UPDATE {quoted_tbl} SET {quoted_modify} = :visit_date "
+            f"WHERE {quoted_pk_local} = :customer_id "
+            f"AND ({quoted_modify} IS NULL OR {quoted_modify} < :visit_date)"
+            f"{date_added_condition}"
         )
-        logger.info(
-            "[CUSTOMER_REPEAT_VISIT_DATE_UPDATED] Customer_ID=%s date_modify=%r",
-            customer_id, clean_date
-        )
+        params = [
+            {"visit_date": visit_date, "customer_id": customer_id}
+            for customer_id, visit_date in pending_repeat_dates.items()
+        ]
+        if params:
+            conn.execute(update_stmt, params)
+            logger.info(
+                "[CUSTOMER_REPEAT_VISIT_DATE_BATCHED] processed=%s",
+                len(params)
+            )
+        pending_repeat_dates.clear()
 
     # 2. Inspect existing customer records from database
     mobile_to_customer: Dict[str, Dict[str, Any]] = {}
@@ -554,9 +584,9 @@ def process_customer_migration(
         # Rule 3: Both customer name and mobile number are empty -> Skip
         # -------------------------------------------------------------
         if not norm_name and not norm_mobile:
-            logger.info(
-                f"[CUSTOMER_SKIPPED_EMPTY_IDENTITY] upload_id={upload_id} source_row={source_row_num}: "
-                f"Both customer name and mobile number are empty. Row skipped from Customer table."
+            logger.debug(
+                "[CUSTOMER_SKIPPED_EMPTY_IDENTITY] upload_id=%s source_row=%s",
+                upload_id, source_row_num
             )
             t_stat.skipped += 1
             continue
@@ -747,6 +777,9 @@ def process_customer_migration(
                 tbl_idx + 1,
                 total_tables
             )
+
+    # One batched DB call for all repeat-visit date updates collected above.
+    flush_repeat_visit_dates()
 
     logger.info(
         f"[CUSTOMER_MIGRATION] Finished '{table_name}': "
