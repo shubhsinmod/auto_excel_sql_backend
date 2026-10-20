@@ -306,7 +306,8 @@ class MigrationService:
                     inserted=ins,
                     reused=reus,
                     tables_completed=tbl_idx - 1 if rows_done < tbl_total_rows else tbl_idx,
-                    total_tables=num_tables
+                    total_tables=num_tables,
+                    current_table_idx=tbl_idx
                 )
             res = MigrationEngine.execute_migration(
                 upload_id,
