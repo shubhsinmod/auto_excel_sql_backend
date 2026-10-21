@@ -67,3 +67,11 @@ def health():
         "db_type": settings.DB_TYPE,
         "db_name": settings.DB_NAME
     }
+
+@app.on_event("startup")
+def on_startup():
+    try:
+        from app.services.file_tracking_service import file_tracking_service
+        file_tracking_service.ensure_schema()
+    except Exception as e:
+        logger.warning(f"Could not verify file tracking schema on startup: {e}")

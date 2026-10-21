@@ -61,7 +61,16 @@ class ExcelService:
         if not is_valid_ext:
             raise ValueError(ext_error)
 
-        # 2. Generate unique upload session ID
+        # 2. Register file tracking in database to generate unique FileID
+        file_id = None
+        try:
+            from app.services.file_tracking_service import file_tracking_service
+            file_id = file_tracking_service.create_uploaded_file(original_filename)
+        except Exception as ft_err:
+            logger.error(f"[FILE_TRACKING] Failed to register file '{original_filename}': {ft_err}")
+            raise
+
+        # 3. Generate unique upload session ID
         upload_id = f"upload_{uuid.uuid4().hex[:12]}"
         safe_ext = os.path.splitext(original_filename)[1].lower()
         target_filename = f"{upload_id}{safe_ext}"
@@ -99,6 +108,7 @@ class ExcelService:
                 original_filename=original_filename,
                 upload_id=upload_id
             )
+            analysis_data["fileId"] = file_id
         except Exception as e:
             if os.path.exists(target_file_path):
                 os.remove(target_file_path)
@@ -112,7 +122,8 @@ class ExcelService:
         session_payload = {
             **analysis_data,
             "filePath": target_file_path,
-            "fileSha256": file_sha256
+            "fileSha256": file_sha256,
+            "fileId": file_id
         }
         with open(session_file_path, "w", encoding="utf-8") as f:
             json.dump(session_payload, f, indent=2)

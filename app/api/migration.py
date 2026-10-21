@@ -13,6 +13,16 @@ from app.core.logging import logger
 
 router = APIRouter(prefix="/api/migration", tags=["Migration"])
 
+@router.get("/files")
+def list_uploaded_files(limit: int = 50):
+    """
+    Returns list of uploaded files and their migration status.
+    """
+    from app.services.file_tracking_service import file_tracking_service
+    return file_tracking_service.get_uploaded_files(limit=limit)
+
+
+
 
 @router.post("/values/{upload_id}", response_model=Step3ProcessingResponse)
 def update_value_mappings(upload_id: str, request: ValueOverridesRequest):

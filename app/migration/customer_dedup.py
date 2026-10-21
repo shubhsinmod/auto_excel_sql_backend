@@ -415,7 +415,8 @@ def process_customer_migration(
     progress_callback: Optional[Callable[[str, int, int, int, int, int, int], None]] = None,
     tbl_idx: int = 0,
     total_tables: int = 1,
-    outlet_id_cache: Optional[Dict[str, Any]] = None
+    outlet_id_cache: Optional[Dict[str, Any]] = None,
+    file_id: Optional[int] = None
 ) -> Dict[str, int]:
     """
     Executes customer deduplication, insertion, and ID mapping within the migration engine transaction.
@@ -636,6 +637,7 @@ def process_customer_migration(
     pending_customers: List[Dict[str, Any]] = []
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
+    file_id_col = next((c.name for c in t_meta.columns if c.name.lower() == "fileid"), None)
 
     # Discover foreign keys constrained on Customer (e.g. Outlet_ID)
     fk_injections: Dict[str, Tuple[str, str]] = {
@@ -735,7 +737,9 @@ def process_customer_migration(
                     source_row_num=source_row_num,
                     get_df_val=get_df_val,
                     unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache
+                    outlet_id_cache=outlet_id_cache,
+                    file_id=file_id,
+                    file_id_col=file_id_col
                 )
 
                 set_insert_visit_dates(param_dict, row)
@@ -805,7 +809,9 @@ def process_customer_migration(
                     source_row_num=source_row_num,
                     get_df_val=get_df_val,
                     unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache
+                    outlet_id_cache=outlet_id_cache,
+                    file_id=file_id,
+                    file_id_col=file_id_col
                 )
 
                 set_insert_visit_dates(param_dict, row)
@@ -925,12 +931,9 @@ def process_customer_migration(
 
                 if dialect_name == "mssql":
                     sql = (
-                        f"SET NOCOUNT ON;\n"
-                        f"DECLARE @ins_cust TABLE (_cid BIGINT, _rn INT IDENTITY(1,1));\n"
                         f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)})\n"
-                        f"OUTPUT INSERTED.{quoted_pk} INTO @ins_cust (_cid)\n"
-                        f"VALUES {', '.join(val_clauses)};\n"
-                        f"SELECT _cid, _rn FROM @ins_cust ORDER BY _rn ASC;"
+                        f"OUTPUT INSERTED.{quoted_pk}\n"
+                        f"VALUES {', '.join(val_clauses)};"
                     )
                 elif dialect_name in ("postgresql", "postgres", "sqlite"):
                     sql = f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)} RETURNING {quoted_pk}"
@@ -1113,7 +1116,9 @@ def _build_customer_param_dict(
     source_row_num: int,
     get_df_val: Callable[[Dict[str, Any], Optional[str]], Any],
     unmapped_empty_cols: Optional[List[str]] = None,
-    outlet_id_cache: Optional[Dict[str, Any]] = None
+    outlet_id_cache: Optional[Dict[str, Any]] = None,
+    file_id: Optional[int] = None,
+    file_id_col: Optional[str] = None
 ) -> Dict[str, Any]:
     """Builds a complete parameter dictionary for Customer insertion."""
     param_dict: Dict[str, Any] = {
@@ -1203,6 +1208,9 @@ def _build_customer_param_dict(
         for _col in t_meta.columns:
             if should_fill_unmapped_text_column(_col, t_meta):
                 param_dict.setdefault(_col.name, "")
+
+    if file_id_col and file_id is not None:
+        param_dict[file_id_col] = file_id
 
     return param_dict
 

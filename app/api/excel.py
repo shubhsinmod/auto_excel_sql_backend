@@ -36,6 +36,15 @@ async def upload_excel(file: UploadFile = File(...)):
         )
 
 
+@router.get("/history/files")
+def get_uploaded_files_history(limit: int = 50):
+    """
+    Returns history of uploaded Excel/CSV files with FileID, FileName, UploadedAt, and Status.
+    """
+    from app.services.file_tracking_service import file_tracking_service
+    return file_tracking_service.get_uploaded_files(limit=limit)
+
+
 @router.get("/{upload_id}")
 async def get_excel_session(upload_id: str):
     """

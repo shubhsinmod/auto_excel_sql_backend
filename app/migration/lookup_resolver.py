@@ -47,32 +47,49 @@ def is_item_master_target(parent_table: str, child_table: str, child_column: str
     return (is_item_parent and is_item_col) or (is_line_child and is_item_col)
 
 
+_ITEM_KEY_SET = {"description", "item", "itemname", "productname", "product", "menuitem", "dish"}
+_CAT_KEY_SET = {"category", "catname", "categoryname", "subcategory", "itemcategory"}
+_GRP_KEY_SET = {"itemgroup", "groupname", "menugroup", "group", "section", "dept"}
+_DISCOVERED_COLS: Dict[Tuple[str, ...], Tuple[Optional[str], Optional[str], Optional[str]]] = {}
+
+
 def item_row_source_key(row_data: Optional[Dict[str, Any]], s_val: Optional[str] = None) -> Tuple[str, str, str]:
-    """Extract normalized (name, category, group) from row data for item lookup caching."""
+    """Extract normalized (name, category, group) from row data for item lookup caching with fast-path lookup."""
     name_norm = normalize_cell_value(s_val or "") if s_val else ""
     cat_norm = ""
     grp_norm = ""
-    if isinstance(row_data, dict):
-        # If name was not supplied directly, try discovering from row_data
-        if not name_norm:
-            item_keys = ("description", "item", "item_name", "itemname", "product_name", "product", "menu_item", "dish")
-            for k, v in row_data.items():
+    if isinstance(row_data, dict) and row_data:
+        keys_tuple = tuple(row_data.keys())
+        discovered = _DISCOVERED_COLS.get(keys_tuple)
+        if discovered is None:
+            item_col = None
+            cat_col = None
+            grp_col = None
+            for k in keys_tuple:
                 k_clean = str(k).lower().replace("_", "").replace(" ", "")
-                if any(ik == k_clean for ik in item_keys) and not is_empty_or_na(v):
-                    name_norm = normalize_cell_value(str(v).strip())
-                    break
-        cat_keys = ("category", "cat_name", "category_name", "sub_category", "subcategory", "item_category")
-        for k, v in row_data.items():
-            k_clean = str(k).lower().replace("_", "").replace(" ", "")
-            if any(ck == k_clean for ck in cat_keys) and not is_empty_or_na(v):
+                if not item_col and k_clean in _ITEM_KEY_SET:
+                    item_col = k
+                elif not cat_col and k_clean in _CAT_KEY_SET:
+                    cat_col = k
+                elif not grp_col and k_clean in _GRP_KEY_SET:
+                    grp_col = k
+            discovered = (item_col, cat_col, grp_col)
+            _DISCOVERED_COLS[keys_tuple] = discovered
+
+        item_col, cat_col, grp_col = discovered
+        if not name_norm and item_col:
+            v = row_data.get(item_col)
+            if v is not None and not is_empty_or_na(v):
+                name_norm = normalize_cell_value(str(v).strip())
+        if cat_col:
+            v = row_data.get(cat_col)
+            if v is not None and not is_empty_or_na(v):
                 cat_norm = normalize_cell_value(str(v).strip())
-                break
-        grp_keys = ("item_group", "itemgroup", "group_name", "menu_group", "menugroup", "group", "section", "dept")
-        for k, v in row_data.items():
-            k_clean = str(k).lower().replace("_", "").replace(" ", "")
-            if any(gk == k_clean for gk in grp_keys) and not is_empty_or_na(v):
+        if grp_col:
+            v = row_data.get(grp_col)
+            if v is not None and not is_empty_or_na(v):
                 grp_norm = normalize_cell_value(str(v).strip())
-                break
+
     return (name_norm, cat_norm, grp_norm)
 
 
