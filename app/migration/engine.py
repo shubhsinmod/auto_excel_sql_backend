@@ -2399,7 +2399,111 @@ class MigrationEngine:
                                     return
                             except Exception as batch_ord_err:
                                 err_msg = str(batch_ord_err).lower()
-                                if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                                is_dup_err = ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg)
+                                if is_dup_err and len(subchunk) > 1:
+                                    try:
+                                        # Fast batch resolution for duplicate orders: query all invoice/bno in 1 single SELECT
+                                        cand_cols = [c for c in chunk_cols if _norm_str(c) in ("invoiceno", "invoicenumber", "invoice", "billno", "billnumber", "bill_number")]
+                                        inv_key_to_items = {}
+                                        for it in subchunk:
+                                            p_d = it[0]
+                                            k = str(it[5] or "").strip()
+                                            if not k:
+                                                for c in cand_cols:
+                                                    if p_d.get(c):
+                                                        k = str(p_d[c]).strip()
+                                                        break
+                                            if k:
+                                                inv_key_to_items.setdefault(k, []).append(it)
+
+                                        existing_ord_map = {}
+                                        if inv_key_to_items and cand_cols:
+                                            all_keys = list(inv_key_to_items.keys())
+                                            ph_o = [f":ok_{idx}" for idx in range(len(all_keys))]
+                                            p_ok = {f"ok_{idx}": k for idx, k in enumerate(all_keys)}
+                                            where_clauses = [f"{quote_identifier(c, dialect_name)} IN ({', '.join(ph_o)})" for c in cand_cols]
+                                            sel_o_cols = [quoted_pk] + [quote_identifier(c, dialect_name) for c in cand_cols]
+                                            sel_o_sql = f"SELECT {', '.join(sel_o_cols)} FROM {quoted_tbl} WHERE {' OR '.join(where_clauses)}"
+                                            o_rows = conn.execute(text(sel_o_sql), p_ok).fetchall()
+                                            for o_row in o_rows:
+                                                found_oid = o_row[0]
+                                                for col_val in o_row[1:]:
+                                                    if col_val:
+                                                        existing_ord_map[str(col_val).strip()] = found_oid
+
+                                        existing_sub = []
+                                        new_sub = []
+                                        for it in subchunk:
+                                            p_d = it[0]
+                                            k = str(it[5] or "").strip()
+                                            if not k:
+                                                for c in cand_cols:
+                                                    if p_d.get(c):
+                                                        k = str(p_d[c]).strip()
+                                                        break
+                                            if k and k in existing_ord_map:
+                                                existing_sub.append((it, existing_ord_map[k]))
+                                            else:
+                                                new_sub.append(it)
+
+                                        if existing_sub:
+                                            pk_name = pk_cols[0] if pk_cols else "Order_ID"
+                                            upd_cols = [c for c in chunk_cols if c != pk_name and c not in identity_cols]
+                                            quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                                            upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quote_identifier(pk_name, dialect_name)} = :_override_oid")
+                                            batch_upd = []
+                                            oids_cleared = []
+                                            for it, exist_oid in existing_sub:
+                                                p_d, _, r_i, _, r_k_t, r_i_v = it
+                                                if duplicate_action == "skip":
+                                                    skipped_order_ids.add(exist_oid)
+                                                    t_stat.skipped += 1
+                                                else:
+                                                    u_p = {c: _to_native_py(p_d.get(c)) for c in upd_cols}
+                                                    u_p["_override_oid"] = exist_oid
+                                                    batch_upd.append(u_p)
+                                                    oids_cleared.append(exist_oid)
+                                                    t_stat.updated += 1
+                                                generated_ids_by_table[table_name].append(exist_oid)
+                                                if bno_col and p_d.get(bno_col) is not None:
+                                                    b_val = str(p_d[bno_col]).strip()
+                                                    id_store.register_id(table_name, b_val, exist_oid)
+                                                    id_store.register_id(table_name, b_val.casefold(), exist_oid)
+                                                if r_i_v is not None:
+                                                    inv_k = str(r_i_v).strip().casefold()
+                                                    id_store.register_id(table_name, inv_k, exist_oid)
+                                                    for s_idx in order_source_rows_by_invoice.get(inv_k, []):
+                                                        id_store.register_row_id(table_name, int(s_idx), exist_oid)
+                                                id_store.register_row_id(table_name, int(r_i), exist_oid)
+                                                id_store.register_composite_key(table_name, r_k_t, exist_oid)
+                                                source_row_indices_with_insert.add(int(r_i))
+
+                                            if batch_upd:
+                                                conn.execute(upd_stmt, batch_upd)
+                                            if oids_cleared:
+                                                ph_cl = [f":o_{i}" for i in range(len(oids_cleared))]
+                                                p_cl = {f"o_{i}": v for i, v in enumerate(oids_cleared)}
+                                                try:
+                                                    conn.execute(text(f"DELETE FROM {quote_identifier('OrderLineItems', dialect_name)} WHERE {quote_identifier('Order_ID', dialect_name)} IN ({', '.join(ph_cl)})"), p_cl)
+                                                except Exception:
+                                                    pass
+
+                                        if new_sub:
+                                            if len(new_sub) < len(subchunk):
+                                                _insert_order_subchunk(new_sub)
+                                            else:
+                                                mid = len(subchunk) // 2
+                                                _insert_order_subchunk(subchunk[:mid])
+                                                _insert_order_subchunk(subchunk[mid:])
+                                        return
+                                    except Exception as o_res_err:
+                                        logger.debug(f"[ORDER_BATCH_DUP_FALLBACK] {o_res_err}")
+                                        mid = len(subchunk) // 2
+                                        _insert_order_subchunk(subchunk[:mid])
+                                        _insert_order_subchunk(subchunk[mid:])
+                                        return
+
+                                if len(subchunk) > 1 and is_dup_err:
                                     mid = len(subchunk) // 2
                                     _insert_order_subchunk(subchunk[:mid])
                                     _insert_order_subchunk(subchunk[mid:])
@@ -2565,7 +2669,101 @@ class MigrationEngine:
                             return
                         except Exception as batch_err:
                             err_msg = str(batch_err).lower()
-                            if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                            is_dup_err = ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg)
+                            if is_dup_err and len(subchunk) > 1:
+                                try:
+                                    b_num_col = next((c for c in col_meta_map if _norm_str(c) in ("billnumber", "bill_number")), None)
+                                    q_bno_col = quote_identifier(b_num_col, dialect_name) if b_num_col else None
+
+                                    key_to_items = {}
+                                    for it in subchunk:
+                                        p_d = it[0]
+                                        k = str(p_d.get(target_pk_col) or (p_d.get(b_num_col) if b_num_col else "") or it[5] or "").strip()
+                                        if k:
+                                            key_to_items.setdefault(k, []).append(it)
+
+                                    existing_bno_map = {}
+                                    if key_to_items:
+                                        all_keys = list(key_to_items.keys())
+                                        ph_b = [f":bk_{idx}" for idx in range(len(all_keys))]
+                                        p_bk = {f"bk_{idx}": k for idx, k in enumerate(all_keys)}
+                                        where_conds = [f"{quoted_target_pk} IN ({', '.join(ph_b)})"]
+                                        if q_bno_col:
+                                            where_conds.append(f"{q_bno_col} IN ({', '.join(ph_b)})")
+                                        sel_b_cols = [quoted_target_pk] + ([q_bno_col] if q_bno_col else [])
+                                        sel_b_sql = f"SELECT {', '.join(sel_b_cols)} FROM {quoted_tbl} WHERE {' OR '.join(where_conds)}"
+                                        b_rows = conn.execute(text(sel_b_sql), p_bk).fetchall()
+                                        for b_row in b_rows:
+                                            pk_val = b_row[0]
+                                            existing_bno_map[str(pk_val).strip()] = pk_val
+                                            if q_bno_col and len(b_row) > 1 and b_row[1]:
+                                                existing_bno_map[str(b_row[1]).strip()] = pk_val
+
+                                    existing_sub = []
+                                    new_sub = []
+                                    for it in subchunk:
+                                        p_d = it[0]
+                                        k = str(p_d.get(target_pk_col) or (p_d.get(b_num_col) if b_num_col else "") or it[5] or "").strip()
+                                        if k and k in existing_bno_map:
+                                            existing_sub.append((it, existing_bno_map[k]))
+                                        else:
+                                            new_sub.append(it)
+
+                                    if existing_sub:
+                                        upd_cols = [c for c in chunk_cols if c != target_pk_col and c not in identity_cols]
+                                        quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                                        upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_target_pk} = :_override_bno")
+                                        batch_upd = []
+                                        bnos_cleared = []
+                                        for it, exist_bno in existing_sub:
+                                            p_d, _, r_i, _, r_k_t, r_i_v = it
+                                            if duplicate_action == "skip":
+                                                skipped_bill_nos.add(exist_bno)
+                                                t_stat.skipped += 1
+                                            else:
+                                                u_p = {c: _to_native_py(p_d.get(c)) for c in upd_cols}
+                                                u_p["_override_bno"] = _to_native_py(exist_bno)
+                                                batch_upd.append(u_p)
+                                                bnos_cleared.append(exist_bno)
+                                                t_stat.updated += 1
+                                            b_id_str = str(exist_bno).strip()
+                                            id_store.register_id(table_name, b_id_str, exist_bno)
+                                            id_store.register_id(table_name, b_id_str.casefold(), exist_bno)
+                                            id_store.register_id(table_name, normalize_string(b_id_str), exist_bno)
+                                            if r_i_v is not None:
+                                                inv_k = str(r_i_v).strip()
+                                                id_store.register_id(table_name, inv_k, exist_bno)
+                                                id_store.register_id(table_name, inv_k.casefold(), exist_bno)
+                                            id_store.register_row_id(table_name, int(r_i), exist_bno)
+                                            id_store.register_composite_key(table_name, r_k_t, exist_bno)
+                                            source_row_indices_with_insert.add(int(r_i))
+
+                                        if batch_upd:
+                                            conn.execute(upd_stmt, batch_upd)
+                                        if bnos_cleared:
+                                            ph_cl = [f":b_{i}" for i in range(len(bnos_cleared))]
+                                            p_cl = {f"b_{i}": _to_native_py(v) for i, v in enumerate(bnos_cleared)}
+                                            try:
+                                                conn.execute(text(f"DELETE FROM {quote_identifier('Settlement', dialect_name)} WHERE {quoted_target_pk} IN ({', '.join(ph_cl)})"), p_cl)
+                                            except Exception:
+                                                pass
+
+                                    if new_sub:
+                                        if len(new_sub) < len(subchunk):
+                                            _insert_bill_subchunk(new_sub)
+                                        else:
+                                            mid = len(subchunk) // 2
+                                            _insert_bill_subchunk(subchunk[:mid])
+                                            _insert_bill_subchunk(subchunk[mid:])
+                                    return
+                                except Exception as b_res_err:
+                                    logger.debug(f"[BILLS_BATCH_DUP_FALLBACK] {b_res_err}")
+                                    mid = len(subchunk) // 2
+                                    _insert_bill_subchunk(subchunk[:mid])
+                                    _insert_bill_subchunk(subchunk[mid:])
+                                    return
+
+                            if len(subchunk) > 1 and is_dup_err:
                                 mid = len(subchunk) // 2
                                 _insert_bill_subchunk(subchunk[:mid])
                                 _insert_bill_subchunk(subchunk[mid:])

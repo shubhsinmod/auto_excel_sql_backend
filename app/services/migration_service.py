@@ -221,6 +221,13 @@ class MigrationService:
         )
 
         with self._lock:
+            if len(self._step3_cache) >= 4:
+                oldest_keys = list(self._step3_cache.keys())[:-3]
+                for k in oldest_keys:
+                    self._step3_cache.pop(k, None)
+                    self._migration_cache.pop(k, None)
+                    self._user_overrides.pop(k, None)
+                    self._user_value_overrides.pop(k, None)
             self._step3_cache[upload_id] = response
 
         return response
@@ -316,6 +323,10 @@ class MigrationService:
             )
             if res.transaction == "COMMITTED" or res.status == "BLOCKED":
                 with self._lock:
+                    if len(self._migration_cache) >= 4:
+                        oldest = list(self._migration_cache.keys())[:-3]
+                        for k in oldest:
+                            self._migration_cache.pop(k, None)
                     self._migration_cache[upload_id] = res
             if res.transaction == "COMMITTED":
                 try:
