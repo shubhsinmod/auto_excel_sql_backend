@@ -15,11 +15,11 @@ from app.api import database_router, excel_router, migration_router, synonyms_ro
 
 # Initialize logging
 setup_logging()
-logger.info(f"Starting Intelligent Excel-to-SQL backend in {settings.APP_ENV} mode")
+logger.info(f"Starting DataBridge backend in {settings.APP_ENV} mode")
 
 app = FastAPI(
-    title="Intelligent Excel-to-SQL API",
-    description="Automatic Excel to Database Migration System",
+    title="DataBridge API",
+    description="Automated Data Migration Platform",
     version="1.0.0"
 )
 
@@ -53,8 +53,8 @@ app.include_router(auth_router)
 @app.get("/")
 def root():
     return {
-        "app": "Intelligent Excel-to-SQL",
-        "application": "Intelligent Excel-to-SQL",
+        "app": "DataBridge",
+        "application": "DataBridge",
         "status": "online",
         "docs": "/docs"
     }
@@ -75,3 +75,4 @@ def on_startup():
         file_tracking_service.ensure_schema()
     except Exception as e:
         logger.warning(f"Could not verify file tracking schema on startup: {e}")
+
