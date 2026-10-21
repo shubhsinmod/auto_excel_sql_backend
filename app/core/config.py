@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     # Application Configuration
     APP_ENV: str = Field(default="development")
     LOG_LEVEL: str = Field(default="INFO")
+    ENABLE_CONSOLE_LOGS: bool = Field(default=False, description="Whether to output logs to terminal/console.")
     SECRET_KEY: str = Field(default="dev-secret-key-123")
     DRY_RUN_MODE: bool = Field(default=False, description="Global dry-run test mode flag. Disabled by default.")
     DRY_RUN_MASK_SENSITIVE: bool = Field(default=True, description="Mask phone numbers and sensitive data in logs by default.")

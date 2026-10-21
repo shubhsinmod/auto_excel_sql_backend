@@ -150,7 +150,8 @@ class MigrationJobManager:
         inserted: int,
         reused: int,
         tables_completed: int = 0,
-        total_tables: int = 0
+        total_tables: int = 0,
+        current_table_idx: Optional[int] = None
     ) -> None:
         with self._lock:
             job = self._jobs.get(upload_id)
@@ -161,7 +162,20 @@ class MigrationJobManager:
             elapsed = round(time.time() - t_start, 2)
 
             pct = 0.0
-            if total_rows > 0:
+            num_tables = total_tables if total_tables > 0 else job.total_tables
+            active_tbl_idx = current_table_idx
+            if active_tbl_idx is None and num_tables > 1 and tables_completed > 0:
+                active_tbl_idx = min(num_tables, tables_completed + 1)
+
+            if active_tbl_idx is not None and num_tables > 1:
+                # Monotonic global progress across all migration tables
+                idx_zero = max(0, min(num_tables - 1, active_tbl_idx - 1))
+                base_pct = (idx_zero / num_tables) * 100.0
+                slice_pct = 100.0 / num_tables
+                table_ratio = (rows_processed / total_rows) if total_rows > 0 else 0.0
+                table_ratio = min(1.0, max(0.0, table_ratio))
+                pct = round(min(99.0, base_pct + (slice_pct * table_ratio)), 1)
+            elif total_rows > 0:
                 pct = round(min(99.0, (rows_processed / total_rows) * 100.0), 1)
 
             job.current_table = current_table
@@ -172,9 +186,10 @@ class MigrationJobManager:
             job.tables_completed = tables_completed
             if total_tables > 0:
                 job.total_tables = total_tables
-            job.percent_complete = pct
+            # Strictly monotonic progress across migration: never resets or decreases
+            job.percent_complete = max(job.percent_complete, pct)
             job.elapsed_seconds = elapsed
-            job.message = f"Processing table [{current_table}] ({rows_processed}/{job.total_rows} rows)"
+            job.message = "Processing and saving Excel data..."
             self._persist_to_disk(job)
 
     def mark_completed(self, upload_id: str, result: MigrationExecutionResponse) -> MigrationJobStatus:

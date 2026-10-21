@@ -356,16 +356,26 @@ class MigrationPreviewEngine:
         total_recs = sum(len(r) for r in parent_records_by_table.values())
         logger.info(f"[STAGE] PARENT_RECORDS_LOADED | records={total_recs} | tables={len(parent_records_by_table)} | {t3 - t1:.3f}s")
 
-        # Tables to inspect for existing records: active target tables + lookup tables
-        tables_to_inspect = list(active_tables_ordered)
-        for rel in lookup_relationships:
-            if rel.parent_table in schema_tables and rel.parent_table not in tables_to_inspect:
-                tables_to_inspect.append(rel.parent_table)
+        # Only inspect external lookup/reference tables (e.g. Outlets, ItemsMaster).
+        # Strictly never perform database duplicate-check queries on active migration target tables.
+        target_entity_names = {
+            "customer", "bills", "bill", "order", "orders", "orderlineitems", "settlement", "settlements"
+        }
+        tables_to_inspect = [
+            rel.parent_table for rel in lookup_relationships
+            if rel.parent_table in schema_tables
+            and rel.parent_table not in active_tables_ordered
+            and rel.parent_table.lower().replace("dbo.", "").strip() not in target_entity_names
+        ]
 
         # 3. Read-only inspection of existing records in database (SELECT only)
         # Optimized: Reuse parent_records_by_table if available to eliminate redundant SELECT queries
-        existing_records_by_table: Dict[str, Dict[str, Any]] = {}
-        existing_keys_set: Dict[str, Set[str]] = {}
+        existing_records_by_table: Dict[str, Dict[str, Any]] = {
+            t: {} for t in active_tables_ordered
+        }
+        existing_keys_set: Dict[str, Set[str]] = {
+            t: set() for t in active_tables_ordered
+        }
         entity_indices: Dict[str, TableEntityLookupIndex] = {}
 
         logger.info(f"[STAGE] EXISTING_RECORD_LOOKUP_START | tables={len(tables_to_inspect)}")

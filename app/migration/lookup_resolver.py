@@ -700,11 +700,9 @@ class DynamicLookupResolver:
             f"{parent_table_name.rstrip('s').lower()} name",
             f"{parent_table_name.rstrip('s').lower()}_name",
             f"{p_norm} name",
-            "description",
-            "item description",
-            "item name",
-            "item"
         ]
+        if is_item_master_target(parent_table_name, "", child_column_name or ""):
+            candidates_to_match.extend(["description", "item description", "item name", "item"])
 
         for col in df_columns:
             if not is_clean_name_col(col):
@@ -851,8 +849,13 @@ class DynamicLookupResolver:
 
                     best_cand = None
                     best_cand_score = 0
+                    child_norm = child_tbl_name.lower().replace("dbo.", "").strip()
                     for candidate_tbl_name, cand_meta in schema_tables.items():
                         if candidate_tbl_name == child_tbl_name:
+                            continue
+                        cand_norm_t = candidate_tbl_name.lower().replace("dbo.", "").strip()
+                        # A header table (like Order) must never infer downstream child tables (OrderLineItems) as its parent
+                        if child_norm in ("order", "orders") and any(k in cand_norm_t for k in ("lineitem", "detail", "modifier")):
                             continue
                         cand_lower = candidate_tbl_name.lower()
                         cand_norm = normalize_column_name(candidate_tbl_name)
@@ -950,8 +953,16 @@ class DynamicLookupResolver:
         schema_tables = {t.name: t for t in schema.tables}
         records_by_table: Dict[str, List[Dict[str, Any]]] = {}
 
-        # Collect unique parent tables to query strictly from discovered relationships
-        tables_to_query: Set[str] = {rel.parent_table for rel in relationships if rel.parent_table in schema_tables}
+        # Collect unique parent tables to query strictly from discovered relationships,
+        # strictly excluding entity target tables being migrated from Excel so no DB duplicate check queries occur.
+        target_entity_names = {
+            "customer", "bills", "bill", "order", "orders", "orderlineitems", "settlement", "settlements"
+        }
+        tables_to_query: Set[str] = {
+            rel.parent_table for rel in relationships
+            if rel.parent_table in schema_tables
+            and rel.parent_table.lower().replace("dbo.", "").strip() not in target_entity_names
+        }
 
         with engine.connect() as conn:
             for table_name in tables_to_query:

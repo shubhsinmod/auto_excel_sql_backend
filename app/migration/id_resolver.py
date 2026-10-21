@@ -46,6 +46,23 @@ class IdResolverStore:
         # Cache variants only, never resolved IDs, so later registrations remain visible.
         self._variants_cache: Dict[str, Tuple[str, ...]] = {}
 
+    @staticmethod
+    def _canonical_table_keys(table: str) -> List[str]:
+        raw = str(table or "").strip()
+        norm = raw.lower().replace("dbo.", "").replace("_", "").replace(" ", "").strip()
+        keys = [raw]
+        if raw.startswith("dbo."):
+            without_dbo = raw[4:]
+            if without_dbo not in keys:
+                keys.append(without_dbo)
+        else:
+            with_dbo = f"dbo.{raw}"
+            if with_dbo not in keys:
+                keys.append(with_dbo)
+        if norm not in keys:
+            keys.append(norm)
+        return keys
+
     def _variants(self, value: Any) -> Tuple[str, ...]:
         key = _valid_source_key(value)
         if key is None:
@@ -63,40 +80,55 @@ class IdResolverStore:
         variants = self._variants(source_key)
         if not variants:
             return
-        table_map = self._mappings.setdefault(table, {})
-        for variant in variants:
-            table_map[variant] = generated_id
-        self._distinct_ids.setdefault(table, set()).add(generated_id)
+        for t_k in self._canonical_table_keys(table):
+            table_map = self._mappings.setdefault(t_k, {})
+            for variant in variants:
+                table_map[variant] = generated_id
+            self._distinct_ids.setdefault(t_k, set()).add(generated_id)
         logger.debug("[ID_RESOLVER] %s: '%s' -> %s", table, variants[0], generated_id)
 
     def register_row_id(self, table: str, row_idx: int, generated_id: Any):
         if generated_id is None:
             return
-        self._row_mappings.setdefault(table, {})[int(row_idx)] = generated_id
-        self._distinct_ids.setdefault(table, set()).add(generated_id)
+        r_int = int(row_idx)
+        for t_k in self._canonical_table_keys(table):
+            self._row_mappings.setdefault(t_k, {})[r_int] = generated_id
+            self._distinct_ids.setdefault(t_k, set()).add(generated_id)
 
     def register_composite_key(self, table: str, key_tuple: Tuple, generated_id: Any):
         if generated_id is None or not any(key_tuple):
             return
-        self._composite_mappings.setdefault(table, {})[key_tuple] = generated_id
-        self._distinct_ids.setdefault(table, set()).add(generated_id)
+        for t_k in self._canonical_table_keys(table):
+            self._composite_mappings.setdefault(t_k, {})[key_tuple] = generated_id
+            self._distinct_ids.setdefault(t_k, set()).add(generated_id)
 
     def get_id(self, table: str, source_key: Any) -> Optional[Any]:
         variants = self._variants(source_key)
-        table_map = self._mappings.get(table)
-        if not variants or not table_map:
+        if not variants:
             return None
-        for variant in variants:
-            result = table_map.get(variant)
-            if result is not None:
-                return result
+        for t_k in self._canonical_table_keys(table):
+            table_map = self._mappings.get(t_k)
+            if table_map:
+                for variant in variants:
+                    result = table_map.get(variant)
+                    if result is not None:
+                        return result
         return None
 
     def get_row_id(self, table: str, row_idx: int) -> Optional[Any]:
-        return self._row_mappings.get(table, {}).get(int(row_idx))
+        r_int = int(row_idx)
+        for t_k in self._canonical_table_keys(table):
+            row_map = self._row_mappings.get(t_k)
+            if row_map and r_int in row_map:
+                return row_map[r_int]
+        return None
 
     def get_composite_id(self, table: str, key_tuple: Tuple) -> Optional[Any]:
-        return self._composite_mappings.get(table, {}).get(key_tuple)
+        for t_k in self._canonical_table_keys(table):
+            comp_map = self._composite_mappings.get(t_k)
+            if comp_map and key_tuple in comp_map:
+                return comp_map[key_tuple]
+        return None
 
     def has_composite_key(self, table: str, key_tuple: Tuple) -> bool:
         return self.get_composite_id(table, key_tuple) is not None

@@ -13,10 +13,12 @@ Rules:
 """
 
 from __future__ import annotations
+from datetime import datetime, date
 import math
 import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple, Callable
+import numpy as np
 import pandas as pd
 from sqlalchemy import text, Connection
 
@@ -30,6 +32,53 @@ from app.migration.id_resolver import IdResolverStore
 from app.migration.lookup_resolver import DynamicLookupResolver, LookupRelationship
 from app.migration.engine import sanitize_value
 from app.core.logging import logger
+
+
+def _to_native_py(val: Any) -> Any:
+    """Convert pandas/numpy types to pure Python primitives for SQL driver compatibility."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if isinstance(val, pd.Timestamp):
+        return val.to_pydatetime()
+    return val
+
+
+def sanitize_customer_param_dict(
+    param_dict: Dict[str, Any],
+    t_meta: TableMetadata,
+    table_name: str,
+    col_meta_map: Dict[str, ColumnMetadata]
+) -> None:
+    """Ensure all datetime and typed columns in param_dict are properly sanitized."""
+    for c in list(param_dict.keys()):
+        c_meta = col_meta_map.get(c)
+        if not c_meta:
+            continue
+        c_type = str(getattr(c_meta, "type", "") or "").upper()
+        c_nullable = getattr(c_meta, "nullable", True)
+        if any(t in c_type for t in ("DATE", "DATETIME", "DATETIME2", "SMALLDATETIME")):
+            param_dict[c] = sanitize_value(param_dict[c], c_type, c_nullable)
+            is_customer_modified_date = (
+                str(table_name).lower().replace("dbo.", "").strip() == "customer"
+                and normalized_column_name(c) in {"datemodified", "datemodify", "lastmodified", "updatedat"}
+            )
+            if (
+                param_dict[c] is None
+                and getattr(c_meta, "default", None) is not None
+                and not is_customer_modified_date
+            ):
+                del param_dict[c]
 
 
 def normalize_name(value: Any) -> str:
@@ -122,28 +171,7 @@ def execute_customer_insert(
 ) -> Any:
     """Executes a parameterized INSERT for Customer and captures the generated identity."""
     col_meta_map = {c.name: c for c in t_meta.columns}
-    # Ensure all datetime and typed columns in param_dict are properly sanitized
-    for c in list(param_dict.keys()):
-        c_meta = col_meta_map.get(c)
-        if not c_meta:
-            continue
-        c_type = str(getattr(c_meta, "type", "") or "").upper()
-        c_nullable = getattr(c_meta, "nullable", True)
-        if any(t in c_type for t in ("DATE", "DATETIME", "DATETIME2", "SMALLDATETIME")):
-            param_dict[c] = sanitize_value(param_dict[c], c_type, c_nullable)
-            # Preserve an explicit NULL for Customer.Date_Modified on INSERT.
-            # SQL Server defaults (e.g. GETDATE()) run when the column is omitted,
-            # which incorrectly makes Date_Added and Date_Modified identical for new customers.
-            is_customer_modified_date = (
-                str(table_name).lower().replace("dbo.", "").strip() == "customer"
-                and normalized_column_name(c) in {"datemodified", "datemodify", "lastmodified", "updatedat"}
-            )
-            if (
-                param_dict[c] is None
-                and getattr(c_meta, "default", None) is not None
-                and not is_customer_modified_date
-            ):
-                del param_dict[c]
+    sanitize_customer_param_dict(param_dict, t_meta, table_name, col_meta_map)
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
     quoted_pk = quote_identifier(pk_col, dialect_name)
@@ -159,7 +187,7 @@ def execute_customer_insert(
                 f"VALUES ({', '.join(val_params)})"
             )
             res = conn.execute(insert_stmt, param_dict)
-            return res.scalar()
+            return res.scalar(), False
         except Exception as trigger_err:
             err_str = str(trigger_err).lower()
             if "trigger" in err_str or "output clause without into" in err_str:
@@ -168,24 +196,97 @@ def execute_customer_insert(
                     f"VALUES ({', '.join(val_params)});\n"
                     f"SELECT SCOPE_IDENTITY();"
                 )
-                res = conn.execute(fallback_stmt, param_dict)
-                return res.scalar()
-            raise
+                try:
+                    res = conn.execute(fallback_stmt, param_dict)
+                    return res.scalar(), False
+                except Exception as fb_err:
+                    trigger_err = fb_err
+                    err_str = str(fb_err).lower()
+
+            if "2627" in err_str or "2601" in err_str or "duplicate key" in err_str or "primary key" in err_str or "unique constraint" in err_str:
+                logger.warning(
+                    f"[CUSTOMER_OVERRIDE_ON_DUPLICATE] Duplicate customer key on insert ({trigger_err}); overriding existing record."
+                )
+                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
+                name_col = next((c.name for c in t_meta.columns if "name" in c.name.lower()), "Customer_Name")
+                existing_cid = param_dict.get(pk_col)
+                if existing_cid is None and param_dict.get(mob_col):
+                    q_mob = quote_identifier(mob_col, dialect_name)
+                    existing_cid = conn.execute(
+                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {q_mob} = :m_val"),
+                        {"m_val": str(param_dict[mob_col]).strip()}
+                    ).scalar()
+                elif existing_cid is None and param_dict.get(name_col):
+                    q_nm = quote_identifier(name_col, dialect_name)
+                    existing_cid = conn.execute(
+                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {q_nm} = :n_val"),
+                        {"n_val": str(param_dict[name_col]).strip()}
+                    ).scalar()
+
+                if existing_cid is not None:
+                    upd_cols = [c for c in insert_cols if c != pk_col]
+                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
+                    upd_params = dict(param_dict)
+                    upd_params["_override_cid"] = existing_cid
+                    conn.execute(upd_stmt, upd_params)
+                    return existing_cid, True
+            raise trigger_err
     elif dialect_name in ("postgresql", "postgres"):
-        insert_stmt = text(
-            f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-            f"VALUES ({', '.join(val_params)}) "
-            f"RETURNING {quoted_pk}"
-        )
-        res = conn.execute(insert_stmt, param_dict)
-        return res.scalar()
+        try:
+            insert_stmt = text(
+                f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
+                f"VALUES ({', '.join(val_params)}) "
+                f"RETURNING {quoted_pk}"
+            )
+            res = conn.execute(insert_stmt, param_dict)
+            return res.scalar(), False
+        except Exception as pg_err:
+            err_str = str(pg_err).lower()
+            if "unique" in err_str or "duplicate" in err_str:
+                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
+                existing_cid = param_dict.get(pk_col)
+                if existing_cid is None and param_dict.get(mob_col):
+                    existing_cid = conn.execute(
+                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {quote_identifier(mob_col, dialect_name)} = :m_val"),
+                        {"m_val": str(param_dict[mob_col]).strip()}
+                    ).scalar()
+                if existing_cid is not None:
+                    upd_cols = [c for c in insert_cols if c != pk_col]
+                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
+                    upd_params = dict(param_dict)
+                    upd_params["_override_cid"] = existing_cid
+                    conn.execute(upd_stmt, upd_params)
+                    return existing_cid, True
+            raise pg_err
     else:  # sqlite and generic
-        insert_stmt = text(
-            f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-            f"VALUES ({', '.join(val_params)})"
-        )
-        res = conn.execute(insert_stmt, param_dict)
-        return getattr(res, "lastrowid", None) or param_dict.get(pk_col)
+        try:
+            insert_stmt = text(
+                f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
+                f"VALUES ({', '.join(val_params)})"
+            )
+            res = conn.execute(insert_stmt, param_dict)
+            return getattr(res, "lastrowid", None) or param_dict.get(pk_col), False
+        except Exception as sql_err:
+            err_str = str(sql_err).lower()
+            if "unique" in err_str or "duplicate" in err_str:
+                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
+                existing_cid = param_dict.get(pk_col)
+                if existing_cid is None and param_dict.get(mob_col):
+                    existing_cid = conn.execute(
+                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {quote_identifier(mob_col, dialect_name)} = :m_val"),
+                        {"m_val": str(param_dict[mob_col]).strip()}
+                    ).scalar()
+                if existing_cid is not None:
+                    upd_cols = [c for c in insert_cols if c != pk_col]
+                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
+                    upd_params = dict(param_dict)
+                    upd_params["_override_cid"] = existing_cid
+                    conn.execute(upd_stmt, upd_params)
+                    return existing_cid, True
+            raise sql_err
 
 
 def resolve_customer(
@@ -252,7 +353,8 @@ def resolve_customer(
             ],
             primary_keys=["Customer_ID"]
         )
-        new_id = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
+        insert_res = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
+        new_id = insert_res[0] if isinstance(insert_res, tuple) else insert_res
         return new_id, "INSERTED"
 
     # Rule 2: Mobile empty, customer name present
@@ -280,7 +382,8 @@ def resolve_customer(
             ],
             primary_keys=["Customer_ID"]
         )
-        new_id = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
+        insert_res = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
+        new_id = insert_res[0] if isinstance(insert_res, tuple) else insert_res
         return new_id, "INSERTED"
 
     return None, "SKIPPED"
@@ -311,7 +414,8 @@ def process_customer_migration(
     source_row_indices_with_insert: Set[int],
     progress_callback: Optional[Callable[[str, int, int, int, int, int, int], None]] = None,
     tbl_idx: int = 0,
-    total_tables: int = 1
+    total_tables: int = 1,
+    outlet_id_cache: Optional[Dict[str, Any]] = None
 ) -> Dict[str, int]:
     """
     Executes customer deduplication, insertion, and ID mapping within the migration engine transaction.
@@ -438,11 +542,21 @@ def process_customer_migration(
         if date_modify_db_col:
             param_dict[date_modify_db_col] = None
 
-    # Collect repeat-visit updates and send them to SQL Server in one executemany
-    # operation instead of one UPDATE round-trip for every matched Excel row.
-    pending_repeat_dates: Dict[Any, Any] = {}
+    unmapped_empty_cols = [c.name for c in t_meta.columns if should_fill_unmapped_text_column(c, t_meta)]
 
     def _date_sort_key(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (datetime, date)):
+            return value
+        if isinstance(value, str):
+            val_s = value.strip()
+            if not val_s or val_s.casefold() in {"nan", "none", "null", "nat"}:
+                return None
+            try:
+                return datetime.fromisoformat(val_s)
+            except Exception:
+                pass
         try:
             parsed = pd.to_datetime(value, errors="coerce")
             if pd.isna(parsed):
@@ -466,6 +580,22 @@ def process_customer_migration(
         old_key = _date_sort_key(previous)
         if new_key is not None and (old_key is None or new_key > old_key):
             pending_repeat_dates[customer_id] = clean_date
+
+    def update_pending_repeat_visit_date(p_idx: int, row_dict: Dict[str, Any]) -> None:
+        visit_date = get_visit_date(row_dict)
+        if not date_modify_db_col or visit_date is None:
+            return
+        clean_date = sanitize_customer_date(date_modify_db_col, visit_date)
+        if clean_date is None:
+            return
+        previous = pending_new_cust_repeat_dates.get(p_idx)
+        if previous is None:
+            pending_new_cust_repeat_dates[p_idx] = clean_date
+            return
+        new_key = _date_sort_key(clean_date)
+        old_key = _date_sort_key(previous)
+        if new_key is not None and (old_key is None or new_key > old_key):
+            pending_new_cust_repeat_dates[p_idx] = clean_date
 
     def flush_repeat_visit_dates() -> None:
         if not pending_repeat_dates or not date_modify_db_col:
@@ -496,66 +626,16 @@ def process_customer_migration(
             )
         pending_repeat_dates.clear()
 
-    # 2. Inspect existing customer records from database
+    # 2. In-memory customer tracking (Excel-scoped deduplication only; no DB pre-queries)
     mobile_to_customer: Dict[str, Dict[str, Any]] = {}
     name_to_customer: Dict[str, Dict[str, Any]] = {}
     name_mobile_to_customer: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    pending_repeat_dates: Dict[Any, Any] = {}
+    pending_new_cust_repeat_dates: Dict[int, Any] = {}
+    pending_name_updates: Dict[Any, str] = {}
+    pending_customers: List[Dict[str, Any]] = []
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
-    select_cols = [
-        c.name for c in t_meta.columns
-        if not any(b in str(c.type).upper() for b in ("BINARY", "IMAGE", "VARBINARY", "GEOGRAPHY", "GEOMETRY"))
-    ]
-    quoted_select_cols = [quote_identifier(c, dialect_name) for c in select_cols]
-    lock_clause = "WITH (UPDLOCK, HOLDLOCK)" if dialect_name == "mssql" else ""
-    order_clause = f"ORDER BY {quote_identifier(pk_col, dialect_name)} ASC"
-
-    try:
-        select_sql = f"SELECT {', '.join(quoted_select_cols)} FROM {quoted_tbl} {lock_clause} {order_clause}"
-        existing_rows = conn.execute(text(select_sql)).mappings().all()
-
-        for r_dict in existing_rows:
-            db_id = r_dict.get(pk_col)
-            if db_id is None:
-                continue
-            raw_db_name = r_dict.get(customer_name_db_col)
-            raw_db_mobile = r_dict.get(customer_mobile_db_col)
-
-            norm_mob = normalize_mobile(raw_db_mobile)
-            norm_nm = normalize_name(raw_db_name)
-
-            if norm_mob:
-                first_mobile_record = norm_mob not in mobile_to_customer
-                mobile_to_customer.setdefault(norm_mob, {
-                    "id": db_id, "name": raw_db_name, "mobile": raw_db_mobile, "record": dict(r_dict)
-                })
-                if norm_nm:
-                    name_mobile_to_customer.setdefault((norm_nm, norm_mob), {
-                        "id": db_id, "name": raw_db_name, "mobile": raw_db_mobile, "record": dict(r_dict)
-                    })
-                if first_mobile_record:
-                    id_store.register_id(table_name, norm_mob, db_id)
-                    if raw_db_mobile:
-                        id_store.register_id(table_name, str(raw_db_mobile).strip(), db_id)
-
-            if not norm_mob and norm_nm:
-                if norm_nm in name_to_customer:
-                    logger.warning(
-                        f"[CUSTOMER_AMBIGUOUS_DUPLICATE_NAME] Multiple existing name-only customer IDs "
-                        f"({name_to_customer[norm_nm]['id']}, {db_id}) for name {norm_nm}. "
-                        f"Deterministically selecting lowest ID {name_to_customer[norm_nm]['id']}."
-                    )
-                else:
-                    name_to_customer[norm_nm] = {
-                        "id": db_id,
-                        "name": raw_db_name,
-                        "mobile": None,
-                        "record": dict(r_dict)
-                    }
-                    id_store.register_id(table_name, norm_nm, db_id)
-
-    except Exception as inspect_err:
-        logger.warning(f"[CUSTOMER_MIGRATION] Inspection of existing {table_name} records encountered: {inspect_err}")
 
     # Discover foreign keys constrained on Customer (e.g. Outlet_ID)
     fk_injections: Dict[str, Tuple[str, str]] = {
@@ -568,7 +648,7 @@ def process_customer_migration(
             if rel.child_column not in fk_injections:
                 fk_injections[rel.child_column] = (rel.parent_table, rel.parent_id_column)
 
-    # 3. Process every Excel row
+    # 3. Pass 1: High-speed in-memory classification and deduplication
     num_rows = len(df_records)
     for i in range(num_rows):
         orig_idx = df_indices[i]
@@ -593,49 +673,42 @@ def process_customer_migration(
 
         # -------------------------------------------------------------
         # Rule 1: Mobile present -> mobile is the unique customer matching key.
-        # A mobile number must resolve to one Customer_ID even when the Excel
-        # row has a different/missing name. If the existing name is blank and
-        # the incoming name is present, enrich that customer record in place.
-        # A same-name customer with a different mobile remains a separate record.
         # -------------------------------------------------------------
         if norm_mobile:
             customer_match = mobile_to_customer.get(norm_mobile)
             if customer_match is not None:
-                target_id = customer_match["id"]
-                existing_name = customer_match.get("name")
-                if is_name_blank_or_null(existing_name) and norm_name:
-                    quoted_name_col = quote_identifier(customer_name_db_col, dialect_name)
-                    quoted_pk = quote_identifier(pk_col, dialect_name)
-                    update_sql = (
-                        f"UPDATE {quoted_tbl} SET {quoted_name_col} = :customer_name "
-                        f"WHERE {quoted_pk} = :customer_id"
-                    )
-                    conn.execute(text(update_sql), {
-                        "customer_name": str(raw_name).strip(),
-                        "customer_id": target_id,
-                    })
-                    customer_match["name"] = str(raw_name).strip()
-                    record = customer_match.get("record")
-                    if isinstance(record, dict):
-                        record[customer_name_db_col] = str(raw_name).strip()
-                    logger.info(
-                        "[CUSTOMER_NAME_UPDATED] Customer_ID=%s enriched with name %r",
-                        target_id, str(raw_name).strip()
-                    )
+                if "id" in customer_match:
+                    target_id = customer_match["id"]
+                    existing_name = customer_match.get("name")
+                    if is_name_blank_or_null(existing_name) and norm_name:
+                        pending_name_updates[target_id] = str(raw_name).strip()
+                        customer_match["name"] = str(raw_name).strip()
+                        record = customer_match.get("record")
+                        if isinstance(record, dict):
+                            record[customer_name_db_col] = str(raw_name).strip()
 
-                update_repeat_visit_date(target_id, row)
-                id_store.register_row_id(table_name, int(orig_idx), target_id)
-                id_store.register_id(table_name, norm_mobile, target_id)
-                if raw_mobile:
-                    id_store.register_id(table_name, str(raw_mobile).strip(), target_id)
-                resolved_name = normalize_name(customer_match.get("name")) or norm_name
-                if resolved_name:
-                    id_store.register_id(table_name, resolved_name, target_id)
-                id_store.register_composite_key(table_name, (norm_name, norm_mobile), target_id)
-                t_stat.reused += 1
+                    update_repeat_visit_date(target_id, row)
+                    id_store.register_row_id(table_name, int(orig_idx), target_id)
+                    id_store.register_id(table_name, norm_mobile, target_id)
+                    if raw_mobile:
+                        id_store.register_id(table_name, str(raw_mobile).strip(), target_id)
+                    resolved_name = normalize_name(customer_match.get("name")) or norm_name
+                    if resolved_name:
+                        id_store.register_id(table_name, resolved_name, target_id)
+                    id_store.register_composite_key(table_name, (norm_name, norm_mobile), target_id)
+                    t_stat.reused += 1
+                else:
+                    p_idx = customer_match["pending_index"]
+                    p_cust = pending_customers[p_idx]
+                    p_cust["row_indices"].append(int(orig_idx))
+                    if is_name_blank_or_null(p_cust["insert_name"]) and norm_name:
+                        p_cust["insert_name"] = str(raw_name).strip()
+                        p_cust["param_dict"][customer_name_db_col] = str(raw_name).strip()
+                        p_cust["norm_name"] = norm_name
+                    update_pending_repeat_visit_date(p_idx, row)
+                    t_stat.reused += 1
             else:
-                # No existing customer uses this mobile; insert a new customer.
-                # Missing Customer_Name is stored as an empty string, never 'null'.
+                # No existing customer uses this mobile; create pending new customer
                 insert_name = str(raw_name).strip() if norm_name else ""
                 insert_mobile = str(raw_mobile).strip() if raw_mobile is not None and not is_name_blank_or_null(raw_mobile) else norm_mobile
 
@@ -660,53 +733,50 @@ def process_customer_migration(
                     fk_resolution_cache=fk_resolution_cache,
                     upload_id=upload_id,
                     source_row_num=source_row_num,
-                    get_df_val=get_df_val
+                    get_df_val=get_df_val,
+                    unmapped_empty_cols=unmapped_empty_cols,
+                    outlet_id_cache=outlet_id_cache
                 )
 
                 set_insert_visit_dates(param_dict, row)
-                new_id = execute_customer_insert(
-                    conn=conn,
-                    dialect_name=dialect_name,
-                    table_name=table_name,
-                    param_dict=param_dict,
-                    pk_col=pk_col,
-                    t_meta=t_meta,
-                    source_row_num=source_row_num
-                )
-                if isinstance(new_id, float) and new_id.is_integer():
-                    new_id = int(new_id)
-                elif str(new_id).endswith(".0"):
-                    new_id = int(float(new_id))
-
-                cust_record = {"id": new_id, "name": insert_name, "mobile": insert_mobile, "record": param_dict}
-                mobile_to_customer.setdefault(norm_mobile, cust_record)
+                p_idx = len(pending_customers)
+                p_cust = {
+                    "pending_id": p_idx,
+                    "norm_mobile": norm_mobile,
+                    "raw_mobile": raw_mobile,
+                    "norm_name": norm_name,
+                    "raw_name": raw_name,
+                    "insert_name": insert_name,
+                    "insert_mobile": insert_mobile,
+                    "param_dict": param_dict,
+                    "source_row_num": source_row_num,
+                    "primary_row_idx": int(orig_idx),
+                    "row_indices": [int(orig_idx)]
+                }
+                pending_customers.append(p_cust)
+                mobile_to_customer[norm_mobile] = {"pending_index": p_idx}
                 if norm_name:
-                    name_mobile_to_customer[(norm_name, norm_mobile)] = cust_record
-                generated_ids_by_table[table_name].append(new_id)
-                source_row_indices_with_insert.add(int(orig_idx))
-
-                id_store.register_row_id(table_name, int(orig_idx), new_id)
-                id_store.register_id(table_name, norm_mobile, new_id)
-                if raw_mobile:
-                    id_store.register_id(table_name, str(raw_mobile).strip(), new_id)
-                if norm_name:
-                    id_store.register_id(table_name, norm_name, new_id)
-                id_store.register_composite_key(table_name, (norm_name, norm_mobile), new_id)
-                t_stat.inserted += 1
+                    name_mobile_to_customer[(norm_name, norm_mobile)] = {"pending_index": p_idx}
 
         # -------------------------------------------------------------
         # Rule 2: Mobile is empty, but customer name is present
         # -------------------------------------------------------------
         else:
-            if norm_name in name_to_customer:
-                cust = name_to_customer[norm_name]
-                target_id = cust["id"]
-                update_repeat_visit_date(target_id, row)
-                id_store.register_row_id(table_name, int(orig_idx), target_id)
-                id_store.register_id(table_name, norm_name, target_id)
-                id_store.register_composite_key(table_name, (norm_name, ""), target_id)
-                t_stat.reused += 1
-
+            name_match = name_to_customer.get(norm_name)
+            if name_match is not None:
+                if "id" in name_match:
+                    target_id = name_match["id"]
+                    update_repeat_visit_date(target_id, row)
+                    id_store.register_row_id(table_name, int(orig_idx), target_id)
+                    id_store.register_id(table_name, norm_name, target_id)
+                    id_store.register_composite_key(table_name, (norm_name, ""), target_id)
+                    t_stat.reused += 1
+                else:
+                    p_idx = name_match["pending_index"]
+                    p_cust = pending_customers[p_idx]
+                    p_cust["row_indices"].append(int(orig_idx))
+                    update_pending_repeat_visit_date(p_idx, row)
+                    t_stat.reused += 1
             else:
                 # Insert new name-only customer
                 insert_name = str(raw_name).strip()
@@ -733,41 +803,31 @@ def process_customer_migration(
                     fk_resolution_cache=fk_resolution_cache,
                     upload_id=upload_id,
                     source_row_num=source_row_num,
-                    get_df_val=get_df_val
+                    get_df_val=get_df_val,
+                    unmapped_empty_cols=unmapped_empty_cols,
+                    outlet_id_cache=outlet_id_cache
                 )
 
                 set_insert_visit_dates(param_dict, row)
-
-                new_id = execute_customer_insert(
-                    conn=conn,
-                    dialect_name=dialect_name,
-                    table_name=table_name,
-                    param_dict=param_dict,
-                    pk_col=pk_col,
-                    t_meta=t_meta,
-                    source_row_num=source_row_num
-                )
-                if isinstance(new_id, float) and new_id.is_integer():
-                    new_id = int(new_id)
-                elif str(new_id).endswith(".0"):
-                    new_id = int(float(new_id))
-
-                name_to_customer[norm_name] = {
-                    "id": new_id,
-                    "name": insert_name,
-                    "mobile": None,
-                    "record": param_dict
+                p_idx = len(pending_customers)
+                p_cust = {
+                    "pending_id": p_idx,
+                    "norm_mobile": "",
+                    "raw_mobile": None,
+                    "norm_name": norm_name,
+                    "raw_name": raw_name,
+                    "insert_name": insert_name,
+                    "insert_mobile": insert_mobile,
+                    "param_dict": param_dict,
+                    "source_row_num": source_row_num,
+                    "primary_row_idx": int(orig_idx),
+                    "row_indices": [int(orig_idx)]
                 }
-                generated_ids_by_table[table_name].append(new_id)
-                source_row_indices_with_insert.add(int(orig_idx))
-
-                id_store.register_row_id(table_name, int(orig_idx), new_id)
-                id_store.register_id(table_name, norm_name, new_id)
-                id_store.register_composite_key(table_name, (norm_name, ""), new_id)
-                t_stat.inserted += 1
+                pending_customers.append(p_cust)
+                name_to_customer[norm_name] = {"pending_index": p_idx}
 
         # Periodic progress callback
-        if progress_callback and (i % 250 == 0 or i == num_rows - 1):
+        if progress_callback and (i % 500 == 0 or i == num_rows - 1):
             progress_callback(
                 table_name,
                 i + 1,
@@ -778,7 +838,168 @@ def process_customer_migration(
                 total_tables
             )
 
-    # One batched DB call for all repeat-visit date updates collected above.
+    # -------------------------------------------------------------
+    # Pass 2: High-Performance Multi-Row Batch INSERT for New Customers
+    # -------------------------------------------------------------
+    def _register_inserted_customer(new_id: Any, p_cust: Dict[str, Any], was_updated: bool = False) -> None:
+        if isinstance(new_id, float) and new_id.is_integer():
+            new_id = int(new_id)
+        elif str(new_id).endswith(".0"):
+            new_id = int(float(new_id))
+
+        generated_ids_by_table[table_name].append(new_id)
+        source_row_indices_with_insert.add(p_cust["primary_row_idx"])
+        for idx in p_cust["row_indices"]:
+            id_store.register_row_id(table_name, idx, new_id)
+
+        if p_cust["norm_mobile"]:
+            id_store.register_id(table_name, p_cust["norm_mobile"], new_id)
+            if p_cust["raw_mobile"]:
+                id_store.register_id(table_name, str(p_cust["raw_mobile"]).strip(), new_id)
+            if p_cust["norm_name"]:
+                id_store.register_id(table_name, p_cust["norm_name"], new_id)
+            id_store.register_composite_key(table_name, (p_cust["norm_name"], p_cust["norm_mobile"]), new_id)
+            cust_rec = {"id": new_id, "name": p_cust["insert_name"], "mobile": p_cust["insert_mobile"], "record": p_cust["param_dict"]}
+            mobile_to_customer[p_cust["norm_mobile"]] = cust_rec
+            if p_cust["norm_name"]:
+                name_mobile_to_customer[(p_cust["norm_name"], p_cust["norm_mobile"])] = cust_rec
+        else:
+            if p_cust["norm_name"]:
+                id_store.register_id(table_name, p_cust["norm_name"], new_id)
+                id_store.register_composite_key(table_name, (p_cust["norm_name"], ""), new_id)
+                cust_rec = {"id": new_id, "name": p_cust["insert_name"], "mobile": None, "record": p_cust["param_dict"]}
+                name_to_customer[p_cust["norm_name"]] = cust_rec
+
+        if p_cust["pending_id"] in pending_new_cust_repeat_dates:
+            pending_repeat_dates[new_id] = pending_new_cust_repeat_dates[p_cust["pending_id"]]
+
+        if was_updated:
+            t_stat.updated += 1
+        else:
+            t_stat.inserted += 1
+
+    if pending_customers:
+        for p_cust in pending_customers:
+            sanitize_customer_param_dict(p_cust["param_dict"], t_meta, table_name, col_meta_map)
+
+        customers_by_cols: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+        for p_cust in pending_customers:
+            cols_key = tuple(c for c in p_cust["param_dict"].keys() if c in col_meta_map and not getattr(col_meta_map[c], "identity", False))
+            customers_by_cols.setdefault(cols_key, []).append(p_cust)
+
+        quoted_pk = quote_identifier(pk_col, dialect_name)
+
+        for cols_tuple, cust_chunk_list in customers_by_cols.items():
+            cols = list(cols_tuple)
+            quoted_cols = [quote_identifier(c, dialect_name) for c in cols]
+            max_cols = max(1, len(cols))
+            CHUNK_SIZE = max(1, min(200, 2000 // max_cols))
+
+            def _insert_cust_subchunk(subchunk: List[Dict[str, Any]]) -> None:
+                if not subchunk:
+                    return
+                if len(subchunk) == 1:
+                    p_cust = subchunk[0]
+                    res_val = execute_customer_insert(
+                        conn=conn,
+                        dialect_name=dialect_name,
+                        table_name=table_name,
+                        param_dict=p_cust["param_dict"],
+                        pk_col=pk_col,
+                        t_meta=t_meta,
+                        source_row_num=p_cust["source_row_num"]
+                    )
+                    new_id, was_upd = res_val if isinstance(res_val, tuple) else (res_val, False)
+                    _register_inserted_customer(new_id, p_cust, was_updated=was_upd)
+                    return
+
+                val_clauses = []
+                batch_params = {}
+                for r_idx, p_cust in enumerate(subchunk):
+                    row_placeholders = []
+                    for c in cols:
+                        param_name = f"{c}_{r_idx}"
+                        row_placeholders.append(f":{param_name}")
+                        batch_params[param_name] = _to_native_py(p_cust["param_dict"].get(c))
+                    val_clauses.append(f"({', '.join(row_placeholders)})")
+
+                if dialect_name == "mssql":
+                    sql = (
+                        f"SET NOCOUNT ON;\n"
+                        f"DECLARE @ins_cust TABLE (_cid BIGINT, _rn INT IDENTITY(1,1));\n"
+                        f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)})\n"
+                        f"OUTPUT INSERTED.{quoted_pk} INTO @ins_cust (_cid)\n"
+                        f"VALUES {', '.join(val_clauses)};\n"
+                        f"SELECT _cid, _rn FROM @ins_cust ORDER BY _rn ASC;"
+                    )
+                elif dialect_name in ("postgresql", "postgres", "sqlite"):
+                    sql = f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)} RETURNING {quoted_pk}"
+                else:
+                    sql = None
+
+                if sql:
+                    try:
+                        res = conn.execute(text(sql), batch_params)
+                        fetched_rows = res.fetchall()
+                        if len(fetched_rows) == len(subchunk):
+                            for r_fetch, p_cust in zip(fetched_rows, subchunk):
+                                new_id = r_fetch[0]
+                                _register_inserted_customer(new_id, p_cust)
+                            return
+                    except Exception as batch_err:
+                        err_msg = str(batch_err).lower()
+                        # If conflict/duplicate, bisect into halves so non-conflicting rows succeed in batch
+                        if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                            mid = len(subchunk) // 2
+                            _insert_cust_subchunk(subchunk[:mid])
+                            _insert_cust_subchunk(subchunk[mid:])
+                            return
+
+                for p_cust in subchunk:
+                    res_val = execute_customer_insert(
+                        conn=conn,
+                        dialect_name=dialect_name,
+                        table_name=table_name,
+                        param_dict=p_cust["param_dict"],
+                        pk_col=pk_col,
+                        t_meta=t_meta,
+                        source_row_num=p_cust["source_row_num"]
+                    )
+                    new_id, was_upd = res_val if isinstance(res_val, tuple) else (res_val, False)
+                    _register_inserted_customer(new_id, p_cust, was_updated=was_upd)
+
+            for chunk_start in range(0, len(cust_chunk_list), CHUNK_SIZE):
+                chunk = cust_chunk_list[chunk_start : chunk_start + CHUNK_SIZE]
+                _insert_cust_subchunk(chunk)
+
+                if progress_callback:
+                    progress_callback(
+                        table_name,
+                        min(num_rows, chunk_start + len(chunk)),
+                        num_rows,
+                        t_stat.inserted,
+                        t_stat.reused,
+                        tbl_idx + 1,
+                        total_tables
+                    )
+
+    # -------------------------------------------------------------
+    # Pass 3: Flush Pending Name Updates & Batched Repeat Visit Dates
+    # -------------------------------------------------------------
+    if pending_name_updates:
+        quoted_name_col = quote_identifier(customer_name_db_col, dialect_name)
+        quoted_pk_local = quote_identifier(pk_col, dialect_name)
+        upd_stmt = text(
+            f"UPDATE {quoted_tbl} SET {quoted_name_col} = :customer_name "
+            f"WHERE {quoted_pk_local} = :customer_id"
+        )
+        upd_params = [
+            {"customer_name": name, "customer_id": cid}
+            for cid, name in pending_name_updates.items()
+        ]
+        conn.execute(upd_stmt, upd_params)
+        logger.info("[CUSTOMER_NAME_BATCH_UPDATED] count=%s", len(upd_params))
+
     flush_repeat_visit_dates()
 
     logger.info(
@@ -815,7 +1036,9 @@ def _build_customer_param_dict(
     fk_resolution_cache: Dict[Tuple[str, str, str, str], Any],
     upload_id: str,
     source_row_num: int,
-    get_df_val: Callable[[Dict[str, Any], Optional[str]], Any]
+    get_df_val: Callable[[Dict[str, Any], Optional[str]], Any],
+    unmapped_empty_cols: Optional[List[str]] = None,
+    outlet_id_cache: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Builds a complete parameter dictionary for Customer insertion."""
     param_dict: Dict[str, Any] = {
@@ -843,38 +1066,68 @@ def _build_customer_param_dict(
         c_nullable = getattr(c_meta, "nullable", True)
         param_dict[db_col] = sanitize_value(val_to_use, c_type, c_nullable, allow_literal_null_str=False)
 
-    # Resolve foreign keys on Customer (e.g. Outlet_ID)
+    # Resolve foreign keys on Customer (e.g. Outlet_ID) with cache
     for fk_col, (parent_tbl, parent_col) in fk_injections.items():
         if fk_col in param_dict and param_dict[fk_col] is not None:
+            continue
+        if str(parent_tbl or "").strip().lower().split(".")[-1] == "outlets":
+            from app.migration.lookup_resolver import get_single_outlet_id
+            cached_outlet_id = outlet_id_cache.get(parent_tbl) if outlet_id_cache else None
+            if cached_outlet_id is None:
+                cached_outlet_id = get_single_outlet_id(parent_records_by_table, parent_tbl, parent_col)
+                if outlet_id_cache is not None:
+                    outlet_id_cache[parent_tbl] = cached_outlet_id
+            outlet_col_meta = col_meta_map.get(fk_col)
+            param_dict[fk_col] = sanitize_value(
+                cached_outlet_id,
+                getattr(outlet_col_meta, "type", ""),
+                getattr(outlet_col_meta, "nullable", False)
+            )
             continue
         db_recs = parent_records_by_table.get(parent_tbl, [])
         rel = next((r for r in lookup_relationships if r.child_table == table_name and r.child_column == fk_col), None)
         src_name = get_df_val(row, rel.excel_name_column) if (rel and rel.excel_name_column) else None
         str_name = str(src_name).strip() if src_name is not None else None
 
-        res_rec = DynamicLookupResolver.resolve_foreign_key_record(
-            child_table=table_name,
-            child_column=fk_col,
-            parent_table=parent_tbl,
-            parent_id_column=parent_col,
-            parent_name_column=rel.parent_name_column if rel else None,
-            db_records=db_recs,
-            excel_source_value=str_name,
-            row_resolved_entities={},
-            row_value_mappings=[],
-            row_data=row if isinstance(row, dict) else row.to_dict(),
-            user_override_id=None,
-            all_parent_records=parent_records_by_table,
-            upload_id=upload_id,
-            source_row_num=source_row_num
+        user_override = (
+            user_val_overrides.get(f"{parent_tbl}.{str_name}")
+            or user_val_overrides.get(f"{table_name}.{fk_col}")
+            or user_val_overrides.get(str_name)
         )
+        fk_cache_key = (parent_tbl, parent_col, str_name or "", str(user_override or ""))
+        if fk_cache_key in fk_resolution_cache:
+            res_rec = fk_resolution_cache[fk_cache_key]
+        else:
+            res_rec = DynamicLookupResolver.resolve_foreign_key_record(
+                child_table=table_name,
+                child_column=fk_col,
+                parent_table=parent_tbl,
+                parent_id_column=parent_col,
+                parent_name_column=rel.parent_name_column if rel else None,
+                db_records=db_recs,
+                excel_source_value=str_name,
+                row_resolved_entities={},
+                row_value_mappings=[],
+                row_data=row if isinstance(row, dict) else row.to_dict(),
+                user_override_id=user_override,
+                all_parent_records=parent_records_by_table,
+                upload_id=upload_id,
+                source_row_num=source_row_num
+            )
+            if res_rec.status == "RESOLVED":
+                fk_resolution_cache[fk_cache_key] = res_rec
+
         if res_rec.status == "RESOLVED":
             param_dict[fk_col] = res_rec.matched_primary_key_value
 
     # Populate optional unmapped text columns with empty strings
-    for _col in t_meta.columns:
-        if should_fill_unmapped_text_column(_col, t_meta):
-            param_dict.setdefault(_col.name, "")
+    if unmapped_empty_cols is not None:
+        for _c_name in unmapped_empty_cols:
+            param_dict.setdefault(_c_name, "")
+    else:
+        for _col in t_meta.columns:
+            if should_fill_unmapped_text_column(_col, t_meta):
+                param_dict.setdefault(_col.name, "")
 
     return param_dict
 
@@ -934,18 +1187,6 @@ def preview_customer_counts(
     known_mobiles: Set[str] = set()
     known_names_no_mobile: Set[str] = set()
     known_name_mobile_pairs: Set[Tuple[str, str]] = set()
-
-    for r in existing_records:
-        raw_m = r.get(customer_mobile_db_col)
-        raw_n = r.get(customer_name_db_col)
-        n_m = normalize_mobile(raw_m)
-        n_n = normalize_name(raw_n)
-        if n_m:
-            known_mobiles.add(n_m)
-            if n_n:
-                known_name_mobile_pairs.add((n_n, n_m))
-        elif n_n:
-            known_names_no_mobile.add(n_n)
 
     ins_cnt = 0
     skip_cnt = 0
