@@ -4,45 +4,23 @@ import json
 import time
 import shutil
 import hashlib
-import sqlite3
-import threading
 from typing import Dict, Any, Optional
 from fastapi import UploadFile
 
 from app.excel.validator import validate_excel_file_extension, validate_excel_workbook
 from app.excel.analyzer import analyze_excel_file
+from app.repositories.file_tracking_repository import file_tracking_repository
+from app.repositories.import_history_repository import import_history_repository
 from app.core.logging import logger
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Small local ledger: only successful imports are registered, so failed imports
-# remain retryable. This is independent of the business-table mapping logic.
-IMPORT_HISTORY_DB = os.path.join(os.path.dirname(UPLOAD_DIR), "data", "import_history.sqlite3")
-os.makedirs(os.path.dirname(IMPORT_HISTORY_DB), exist_ok=True)
-_IMPORT_HISTORY_LOCK = threading.Lock()
-
-
-def _initialize_import_history() -> None:
-    with sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS successful_file_imports (
-                file_sha256 TEXT PRIMARY KEY,
-                original_filename TEXT NOT NULL,
-                upload_id TEXT NOT NULL,
-                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-
-
-_initialize_import_history()
-
 
 class ExcelService:
     """
     Service layer handling Excel upload, validation, session storage, and retrieval with timing instrumentation.
+    Delegates database file tracking and ledger operations to dedicated repositories.
     """
 
     @staticmethod
@@ -61,11 +39,10 @@ class ExcelService:
         if not is_valid_ext:
             raise ValueError(ext_error)
 
-        # 2. Register file tracking in database to generate unique FileID
+        # 2. Register file tracking in database via repository to generate unique FileID
         file_id = None
         try:
-            from app.services.file_tracking_service import file_tracking_service
-            file_id = file_tracking_service.create_uploaded_file(original_filename)
+            file_id = file_tracking_repository.create_file_record(original_filename)
         except Exception as ft_err:
             logger.error(f"[FILE_TRACKING] Failed to register file '{original_filename}': {ft_err}")
             raise
@@ -89,7 +66,7 @@ class ExcelService:
         t_save_1 = time.time()
         logger.info(f"[STEP3] Excel file save END | {t_save_1 - t_save_0:.3f}s")
 
-        # 3.5 Content fingerprint calculation for session tracking (duplicate check disabled)
+        # 3.5 Content fingerprint calculation for session tracking
         file_sha256 = ExcelService._sha256_file(target_file_path)
 
         # 4. Validate saved Excel workbook
@@ -143,18 +120,12 @@ class ExcelService:
 
     @staticmethod
     def find_successful_import(file_sha256: str) -> Optional[Dict[str, Any]]:
-        with _IMPORT_HISTORY_LOCK, sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT original_filename, upload_id, imported_at "
-                "FROM successful_file_imports WHERE file_sha256 = ?",
-                (file_sha256,),
-            ).fetchone()
-            return dict(row) if row else None
+        """Finds a previously imported file by SHA-256 using the repository."""
+        return import_history_repository.find_by_sha256(file_sha256)
 
     @staticmethod
     def mark_import_success(upload_id: str) -> None:
-        """Record the content hash only after the SQL transaction commits."""
+        """Records the content hash in the ledger repository after the SQL transaction commits."""
         session = ExcelService.get_upload_session(upload_id)
         if not session:
             logger.warning(f"Cannot register successful import: session {upload_id} not found")
@@ -163,13 +134,11 @@ class ExcelService:
         if not file_sha256:
             logger.warning(f"Cannot register successful import: file hash missing for {upload_id}")
             return
-        with _IMPORT_HISTORY_LOCK, sqlite3.connect(IMPORT_HISTORY_DB, timeout=30) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO successful_file_imports "
-                "(file_sha256, original_filename, upload_id) VALUES (?, ?, ?)",
-                (file_sha256, session.get("fileName") or "uploaded_file", upload_id),
-            )
-            conn.commit()
+        import_history_repository.record_import(
+            file_sha256=file_sha256,
+            original_filename=session.get("fileName") or "uploaded_file",
+            upload_id=upload_id
+        )
 
     @staticmethod
     def get_upload_session(upload_id: str) -> Optional[Dict[str, Any]]:

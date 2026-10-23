@@ -53,7 +53,7 @@ app.include_router(auth_router)
 @app.get("/")
 def root():
     return {
-        "app": "DataBridge",
+        "app": "DataBridge (Intelligent Excel-to-SQL)",
         "application": "DataBridge",
         "status": "online",
         "docs": "/docs"
