@@ -192,8 +192,8 @@ def test_case_4_separate_branches_in_database():
 
 def test_case_5_differing_restaurant_name_and_virtual_brand():
     """
-    Case 5: 'restaurant_name' and 'virtual_brand_name' contain different values resolving to different outlets.
-    Expected: Flagged as DIFFERENT_OUTLETS_DETECTED / AMBIGUOUS for user review.
+    Case 5: 'restaurant_name' and 'virtual_brand_name' contain different values.
+    Expected: outlet comes from restaurant_name only; virtual_brand_name is ignored.
     """
     db_outlets = [
         {"Outlet_ID": 401, "Outlet_Name": "Leon Grill", "Address": "Indiranagar", "Short_Code": "LG"},
@@ -205,10 +205,9 @@ def test_case_5_differing_restaurant_name_and_virtual_brand():
     }
     res = OutletMatcher.resolve_row_outlet(row_data, db_outlets)
 
-    assert res["status"] == "CONFLICTING_OUTLET_VALUES"
-    assert res["match_type"] == "CONFLICTING_OUTLET_VALUES"
-    assert res["outlet_id"] is None
-    assert "Discrepancy" in res["message"]
+    assert res["status"] == "MATCHED"
+    assert res["outlet_id"] == 401
+    assert res["virtual_brand_value"] is None
 
 
 def test_branch_suffix_matches_unique_existing_outlet_name():
@@ -223,7 +222,7 @@ def test_branch_suffix_matches_unique_existing_outlet_name():
 
     assert res["status"] == "MATCHED"
     assert res["outlet_id"] == 1
-    assert res["match_type"].startswith("DUAL_COLUMN_MATCH (BRANCH_SUFFIX_MATCH)")
+    assert res["match_type"] == "BRANCH_SUFFIX_MATCH"
 
 
 def test_branch_suffix_with_multiple_existing_ids_is_ambiguous():
@@ -335,3 +334,49 @@ def test_safe_brand_descriptor_distinction():
     # Must NOT match Namaste!
     assert res["status"] == "UNRESOLVED"
     assert res["outlet_id"] is None
+
+
+
+def test_restaurant_name_normalized_compact_match_and_virtual_brand_ignored():
+    db_outlets = [
+        {"Outlet_ID": 1, "Outlet_Name": "Namaste BTM"},
+        {"Outlet_ID": 7, "Outlet_Name": "NAMASTE-VIJAYANAGAR"},
+    ]
+    for source in ("Namaste - Vijayanagar", "namaste vijayanagar", "Namaste_Vijayanagar ", "NamasteVijayanagar"):
+        res = OutletMatcher.resolve_row_outlet({"restaurant_name": source, "virtual_brand_name": "Namaste BTM"}, db_outlets)
+        assert res["status"] == "MATCHED", source
+        assert res["outlet_id"] == 7, source
+    # virtual_brand_name alone never identifies the outlet
+    res = OutletMatcher.resolve_row_outlet({"restaurant_name": "", "virtual_brand_name": "Namaste BTM"}, db_outlets)
+    assert res["status"] == "MISSING_NAME"
+
+
+def test_different_branch_is_not_matched_by_shared_brand_name():
+    db_outlets = [
+        {"Outlet_ID": 1, "Outlet_Name": "Namaste BTM"},
+        {"Outlet_ID": 9, "Outlet_Name": "Namaste Vijaynagar"},
+    ]
+    res = OutletMatcher.resolve_row_outlet({"restaurant_name": "Namaste - Vijayanagar"}, db_outlets)
+    assert res["status"] == "UNRESOLVED"
+    assert res["outlet_id"] is None
+    assert "Namaste Vijaynagar" in res["message"]  # closest names shown for the user
+
+
+REAL_OUTLETS = [{"Outlet_ID": i, "Outlet_Name": n} for i, n in enumerate(
+    ["BTM", "HSR", "Vijay Nagar", "kalyan nagar", "OLD madras road", "Maleshwaram",
+     "Central Warehouse", "JP Nagar", "Utopia", "Central Kitchen", "Divyashree"], 1)]
+
+
+def test_brand_dash_branch_is_split_and_branch_matched():
+    from app.migration.outlet_matcher import OutletCache
+    res = OutletMatcher.resolve_row_outlet({"restaurant_name": "Namaste - BTM"}, REAL_OUTLETS)
+    assert (res["status"], res["outlet_id"]) == ("MATCHED", 1)
+    res = OutletMatcher.resolve_row_outlet({"restaurant_name": "Namaste - Vijayanagar", "virtual_brand_name": "Namaste"}, REAL_OUTLETS)
+    assert (res["status"], res["outlet_id"], res["match_type"]) == ("MATCHED", 3, "BRANCH_SUFFIX_SPELLING_VARIANT")
+    assert OutletCache(REAL_OUTLETS).resolve_row_outlet_id({"restaurant_name": "Namaste - Vijayanagar"}) == 3
+
+
+def test_unknown_branch_is_not_guessed():
+    for source in ("Namaste - Indiranagar", "Namaste", "Namaste - Koramangala"):
+        res = OutletMatcher.resolve_row_outlet({"restaurant_name": source}, REAL_OUTLETS)
+        assert res["status"] != "MATCHED", source

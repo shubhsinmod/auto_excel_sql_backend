@@ -1,5 +1,6 @@
 from typing import Optional, List, Dict, Any, Callable
 from sqlalchemy import text, Engine
+from sqlalchemy.orm import Session
 from app.database.connection import get_engine
 from app.core.logging import logger
 
@@ -15,8 +16,13 @@ class UserRepository:
     Isolates dialect-specific SQL, connection handling, and data mapping.
     """
 
-    def __init__(self, engine_provider: Optional[Callable[[], Engine]] = None):
+    def __init__(
+        self,
+        engine_provider: Optional[Callable[[], Engine]] = None,
+        session: Optional[Session] = None
+    ):
         self._engine_provider = engine_provider or get_engine
+        self._session = session
 
     def _get_engine(self) -> Engine:
         return self._engine_provider()
@@ -30,8 +36,12 @@ class UserRepository:
         if not normalized_username:
             return []
 
-        engine = self._get_engine()
-        dialect_name = getattr(engine, "name", "mssql").lower()
+        if self._session is not None:
+            bind = self._session.get_bind()
+            dialect_name = getattr(bind, "name", "sqlite").lower()
+        else:
+            engine = self._get_engine()
+            dialect_name = getattr(engine, "name", "mssql").lower()
 
         if dialect_name == "mssql":
             query = text(
@@ -61,6 +71,10 @@ class UserRepository:
                 'WHERE LOWER(TRIM("UserName")) = LOWER(:username) '
                 'LIMIT 2'
             )
+
+        if self._session is not None:
+            rows = self._session.execute(query, {"username": normalized_username}).mappings().all()
+            return [dict(row) for row in rows]
 
         with engine.connect() as connection:
             rows = connection.execute(query, {"username": normalized_username}).mappings().all()

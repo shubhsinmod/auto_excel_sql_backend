@@ -1557,32 +1557,6 @@ class DynamicLookupResolver:
         parent_keys = [parent_table, parent_table.lower(), parent_table.rstrip("s").lower()]
         db_records = db_records or []
 
-        # Outlets currently contains exactly one reference record. Resolve from the
-        # already-loaded DB records and bypass Excel restaurant/brand name matching.
-        if str(parent_table or "").strip().lower().split(".")[-1] == "outlets":
-            outlet_id = get_single_outlet_id(
-                {parent_table: db_records}, parent_table, parent_id_column
-            )
-            outlet_record = next(
-                (r for r in db_records if str(r.get(parent_id_column)) == str(outlet_id)),
-                db_records[0]
-            )
-            result = ResolvedEntityRecord(
-                status="RESOLVED",
-                matchedTable=parent_table,
-                matchedPrimaryKeyColumn=parent_id_column,
-                matchedPrimaryKeyValue=outlet_id,
-                matchedBy=["SINGLE_OUTLET_REFERENCE"],
-                confidence=1.0,
-                recordData=outlet_record,
-                matchMethod="SINGLE_OUTLET_REFERENCE",
-                message="Reused the only existing outlet record; outlet name matching was skipped."
-            )
-            if row_resolved_entities is not None:
-                for key in parent_keys:
-                    row_resolved_entities[key] = result
-            return result
-
         # 1. User Override takes top priority
         if user_override_id is not None:
             override_str = str(user_override_id).strip()

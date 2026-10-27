@@ -740,7 +740,7 @@ class MigrationValidator:
                     else:
                         warnings.append(err)
 
-                elif fk_item.status == "NOT_FOUND":
+                elif fk_item.status in ("NOT_FOUND", "UNRESOLVED", "NO_MATCH", "NO_RECORDS"):
                     unresolved_fks_count += 1
                     ref_key = fk_item.source_business_key
                     if ref_key is None or str(ref_key).strip() == "" or str(ref_key).strip().lower() in ("nan", "none", "null", "nat"):
@@ -792,16 +792,21 @@ class MigrationValidator:
                         severity="ERROR"
                     ))
 
-        # User policy: data validation is enforced only for dbo.Customer.
-        # Findings for every other target table are retained as warnings for visibility,
-        # but are not used to reject source rows or block a migration. Foreign-key
-        # resolution remains a separate operation in the migration engine; SQL Server
-        # constraints still apply when the INSERT is executed.
+        # Retain as blocking errors: all Customer errors, plus any unresolved required foreign keys on active target tables.
+        # Other non-customer findings are retained as warnings for visibility.
         customer_errors: List[RowValidationError] = []
         non_customer_errors: List[RowValidationError] = []
         for error in errors:
             normalized_table = str(error.table_name or "").lower().replace("dbo.", "").strip()
-            if normalized_table == "customer":
+            is_unresolved_req_fk = error.error_type in (
+                "UNRESOLVED_REQUIRED_FOREIGN_KEY",
+                "REQUIRED_FOREIGN_KEY_UNMAPPED",
+                "MISSING_REQUIRED_FOREIGN_KEY",
+                "AMBIGUOUS_FOREIGN_KEY",
+                "MISSING_FOREIGN_KEY_NAME",
+                "UNRESOLVED_FOREIGN_KEY"
+            ) and error.severity == "ERROR"
+            if normalized_table == "customer" or is_unresolved_req_fk:
                 customer_errors.append(error)
             else:
                 non_customer_errors.append(error)

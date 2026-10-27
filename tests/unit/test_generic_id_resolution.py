@@ -469,10 +469,24 @@ def test_sqlserver_trigger_fallback_to_scope_identity():
     mock_cursor_scope = MagicMock()
     mock_cursor_scope.scalar.return_value = 999
 
-    mock_conn.execute.side_effect = [
-        trigger_error,          # Attempt 1: OUTPUT INSERTED fail
-        mock_cursor_scope       # Attempt 2: SCOPE_IDENTITY fallback batch
-    ]
+    # Attempt 1: OUTPUT INSERTED fails; attempt 2: SCOPE_IDENTITY fallback succeeds.
+    # COUNT(*) queries are the real-database verification (before/after + PK check).
+    insert_results = [trigger_error, mock_cursor_scope]
+    table_rows = {"n": 0}
+
+    def _execute(stmt, *args, **kwargs):
+        sql = str(stmt)
+        if "COUNT(*)" in sql:
+            cur = MagicMock()
+            cur.scalar.return_value = 1 if " IN (" in sql else table_rows["n"]
+            return cur
+        result = insert_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        table_rows["n"] = 1
+        return result
+
+    mock_conn.execute.side_effect = _execute
 
     schema_metadata = DatabaseSchemaMetadata(
         database_name="OrdersDB",

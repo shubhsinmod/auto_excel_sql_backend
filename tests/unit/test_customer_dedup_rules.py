@@ -3,9 +3,9 @@ Automated tests for Customer Deduplication Rules in Intelligent Excel-to-SQL.
 
 Covers all 15 required test cases:
 1. Name Rahul, mobile 9876543210 -> insert one customer.
-2. Name Amit, mobile 9876543210 -> reuse the same Customer_ID; do not insert another customer.
+2. Name Amit, mobile 9876543210 -> NEW customer (name + mobile must both match to reuse).
 3. Empty name, mobile 9876543210 -> reuse the existing customer.
-4. Existing customer name is 'null', mobile 9876543210; incoming name is Rahul -> update the name to Rahul.
+4. Existing customer name is 'null', mobile 9876543210; incoming name is Rahul -> new customer, existing row untouched.
 5. Name Rahul, empty mobile -> insert a name-only customer.
 6. Name Amit, empty mobile -> insert a separate customer.
 7. Name Rahul, empty mobile again -> reuse the existing name-only customer.
@@ -78,7 +78,7 @@ def isolated_db():
             CREATE TABLE Customer (
                 Customer_ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 Customer_Name VARCHAR(100) NOT NULL,
-                Mobile_Number VARCHAR(20) UNIQUE
+                Mobile_Number VARCHAR(20)
             )
         """))
         conn.execute(text("""
@@ -104,21 +104,23 @@ def test_case_1_insert_customer_with_name_and_mobile(isolated_db):
         assert row[1] == "9876543210"
 
 
-def test_case_2_reuse_customer_same_mobile_different_name(isolated_db):
-    """Case 2: Name Amit, mobile 9876543210 -> reuse the same Customer_ID; do not insert another customer."""
+def test_case_2_same_mobile_different_name_is_new_customer(isolated_db):
+    """Case 2: Name Amit, mobile 9876543210 -> new customer; Rahul's row is not touched."""
     with isolated_db.begin() as conn:
         cid1, action1 = resolve_customer(conn, "Rahul", "9876543210", dialect_name="sqlite")
         assert action1 == "INSERTED"
 
         cid2, action2 = resolve_customer(conn, "Amit", "9876543210", dialect_name="sqlite")
-        assert action2 == "REUSED"
-        assert cid2 == cid1
+        assert action2 == "INSERTED"
+        assert cid2 != cid1
 
-        # Customer count must strictly remain 1 and valid name Rahul must not be overwritten
-        cnt = conn.execute(text("SELECT COUNT(*) FROM Customer")).scalar()
-        assert cnt == 1
-        name = conn.execute(text("SELECT Customer_Name FROM Customer WHERE Customer_ID = :id"), {"id": cid1}).scalar()
-        assert name == "Rahul"
+        rows = conn.execute(text("SELECT Customer_ID, Customer_Name FROM Customer ORDER BY Customer_ID")).fetchall()
+        assert [(r[0], r[1]) for r in rows] == [(cid1, "Rahul"), (cid2, "Amit")]
+
+        # Same name + same mobile -> reuse
+        cid3, action3 = resolve_customer(conn, " rahul ", "9876543210", dialect_name="sqlite")
+        assert action3 == "REUSED"
+        assert cid3 == cid1
 
 
 def test_case_3_reuse_customer_empty_name_existing_mobile(isolated_db):
@@ -135,16 +137,21 @@ def test_case_3_reuse_customer_empty_name_existing_mobile(isolated_db):
         assert name == "Rahul"
 
 
-def test_case_4_update_existing_customer_name_when_previously_null(isolated_db):
-    """Case 4: Existing customer name is 'null', mobile 9876543210; incoming name is Rahul -> update name to Rahul."""
+def test_case_4_named_row_does_not_overwrite_unnamed_customer(isolated_db):
+    """Case 4: Existing 'null'/9876543210; incoming Rahul/9876543210 -> new customer, existing row untouched."""
     with isolated_db.begin() as conn:
         conn.execute(text("INSERT INTO Customer (Customer_Name, Mobile_Number) VALUES ('null', '9876543210')"))
+        old_id = conn.execute(text("SELECT Customer_ID FROM Customer")).scalar()
 
         cid, action = resolve_customer(conn, "Rahul", "9876543210", dialect_name="sqlite")
-        assert action == "UPDATED_NAME"
+        assert action == "INSERTED"
+        assert cid != old_id
+        assert conn.execute(text("SELECT Customer_Name FROM Customer WHERE Customer_ID = :id"), {"id": old_id}).scalar() == "null"
 
-        name = conn.execute(text("SELECT Customer_Name FROM Customer WHERE Customer_ID = :id"), {"id": cid}).scalar()
-        assert name == "Rahul"
+        # An unnamed row with that mobile still matches by mobile (prefers the unnamed customer).
+        cid_blank, action_blank = resolve_customer(conn, "", "9876543210", dialect_name="sqlite")
+        assert action_blank == "REUSED"
+        assert cid_blank == old_id
 
 
 def test_case_5_insert_name_only_customer(isolated_db):
@@ -226,8 +233,8 @@ def test_case_11_mobile_normalization_spaces_and_floats(isolated_db):
         assert act2 == "REUSED"
         assert cid2 == cid1
 
-        # String with spaces
-        cid3, act3 = resolve_customer(conn, "Amit", "  9876543210  ", dialect_name="sqlite")
+        # String with spaces, same name
+        cid3, act3 = resolve_customer(conn, "Rahul", "  9876543210  ", dialect_name="sqlite")
         assert act3 == "REUSED"
         assert cid3 == cid1
 
@@ -306,14 +313,16 @@ def test_case_12_repeated_rows_in_same_excel_file(isolated_db, migration_test_sc
 
     assert res.status == "COMPLETED"
     with isolated_db.connect() as conn:
-        custs = conn.execute(text("SELECT Customer_ID, Customer_Name, Mobile_Number FROM Customer")).fetchall()
-        assert len(custs) == 1
-        assert custs[0][1] in ("Rahul", "Amit")
-        assert custs[0][2] == "9876543210"
+        custs = conn.execute(text("SELECT Customer_ID, Customer_Name, Mobile_Number FROM Customer ORDER BY Customer_ID")).fetchall()
+        # Rahul and Amit share a mobile but are different customers; the unnamed row
+        # matches by mobile (first customer owning it); the repeated Rahul row is reused.
+        assert [(c[1], c[2]) for c in custs] == [("Rahul", "9876543210"), ("Amit", "9876543210")]
 
         c_stat = res.tables["Customer"]
-        assert c_stat.inserted == 1
-        assert c_stat.reused == 3
+        assert c_stat.inserted == 2
+        assert c_stat.reused == 2
+        orders = conn.execute(text('SELECT Order_Number, Customer_ID FROM "Order" ORDER BY Order_ID')).fetchall()
+        assert [o[1] for o in orders] == [custs[0][0], custs[1][0], custs[0][0], custs[0][0]]
 
 
 def test_case_13_cross_run_deduplication(isolated_db, migration_test_schema):
@@ -347,13 +356,12 @@ def test_case_13_cross_run_deduplication(isolated_db, migration_test_schema):
 
     assert res.status == "COMPLETED"
     with isolated_db.connect() as conn:
-        custs = conn.execute(text("SELECT Customer_ID, Customer_Name, Mobile_Number FROM Customer")).fetchall()
-        assert len(custs) == 1
-        assert custs[0][1] in ("Rahul", "Amit")
+        custs = conn.execute(text("SELECT Customer_ID, Customer_Name, Mobile_Number FROM Customer ORDER BY Customer_ID")).fetchall()
+        assert [(c[1], c[2]) for c in custs] == [("Rahul", "9876543210"), ("Amit", "9876543210")]
 
         c_stat = res.tables["Customer"]
-        assert c_stat.inserted == 0
-        assert (c_stat.reused == 1 or c_stat.updated == 1)
+        assert c_stat.inserted == 1
+        assert c_stat.reused == 0
 
 
 def test_case_14_order_table_customer_id_assignment(isolated_db, migration_test_schema):
@@ -388,12 +396,14 @@ def test_case_14_order_table_customer_id_assignment(isolated_db, migration_test_
         orders = conn.execute(text("SELECT Order_Number, Customer_ID FROM \"Order\" ORDER BY Order_ID")).fetchall()
         assert len(orders) == 4
 
-        rahul_cid = conn.execute(text("SELECT Customer_ID FROM Customer WHERE Mobile_Number = '9876543210'")).scalar()
+        rahul_cid = conn.execute(text("SELECT Customer_ID FROM Customer WHERE Customer_Name = 'Rahul'")).scalar()
+        amit_cid = conn.execute(text("SELECT Customer_ID FROM Customer WHERE Customer_Name = 'Amit'")).scalar()
         priya_cid = conn.execute(text("SELECT Customer_ID FROM Customer WHERE Mobile_Number = '9123456789'")).scalar()
 
-        # ORD-101 and ORD-102 must have the exact same Customer_ID (Rahul's)
+        # Rahul and Amit share a mobile but are different customers with their own IDs
         assert orders[0][1] == rahul_cid
-        assert orders[1][1] == rahul_cid
+        assert orders[1][1] == amit_cid
+        assert rahul_cid != amit_cid
 
         # ORD-103 must have Priya's Customer_ID
         assert orders[2][1] == priya_cid

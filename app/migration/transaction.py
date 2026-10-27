@@ -2,6 +2,7 @@ import time
 import datetime
 import threading
 from typing import Dict, Any, Optional, Callable
+from sqlalchemy import event
 from sqlalchemy.engine import Engine, Connection
 from app.models.migration import MigrationExecutionResponse, TableMigrationStat
 from app.core.logging import logger
@@ -20,6 +21,162 @@ def redact_sensitive_info(message: str) -> str:
     if settings.SECRET_KEY:
         clean = clean.replace(settings.SECRET_KEY, "[REDACTED]")
     return clean
+
+
+class SqlServerTransactionGuard:
+    """
+    Detects when SQL Server has silently ended the migration transaction.
+
+    Some SQL Server errors (conversion errors, many batch-aborting errors, or any
+    error with XACT_ABORT ON) roll back the whole open transaction. The migration
+    code catches many statement errors and retries (e.g. multi-row INSERT ->
+    row-by-row). After such a rollback the ODBC driver silently starts a NEW
+    transaction on the next statement, so:
+      * everything written before the error is gone, and
+      * everything after it lands in a different transaction.
+    The job then still reports success (seen as "Customer verified 0/N",
+    "Order verified 10873/11441").
+
+    This guard watches every statement on the migration connection. When a
+    statement fails, the next statement first checks @@TRANCOUNT / XACT_STATE();
+    if the transaction is gone or doomed it raises with the original error,
+    so the run stops and rolls back instead of continuing in a new transaction.
+    """
+
+    WRITE_PREFIXES = ("insert", "update", "delete", "merge", "set identity_insert")
+
+    def __init__(self, connection: Connection, upload_id: str):
+        self.connection = connection
+        self.upload_id = upload_id
+        self.writes_seen = False
+        self.pending_error: Optional[str] = None
+        self.in_flight: Optional[str] = None
+        self._checking = False
+
+    def attach(self) -> None:
+        event.listen(self.connection, "before_cursor_execute", self._before)
+        event.listen(self.connection, "after_cursor_execute", self._after)
+        try:
+            event.listen(self.connection.engine, "handle_error", self._on_error)
+        except Exception:  # pragma: no cover - older SQLAlchemy
+            pass
+
+    def detach(self) -> None:
+        for target, name, fn in (
+            (self.connection, "before_cursor_execute", self._before),
+            (self.connection, "after_cursor_execute", self._after),
+            (self.connection.engine, "handle_error", self._on_error),
+        ):
+            try:
+                event.remove(target, name, fn)
+            except Exception:
+                pass
+
+    def _on_error(self, ctx) -> None:
+        if ctx.connection is not None and ctx.connection is not self.connection:
+            return
+        msg = redact_sensitive_info(str(getattr(ctx, "original_exception", "") or ""))
+        stmt = (getattr(ctx, "statement", "") or "").strip().replace("\n", " ")[:200]
+        self.pending_error = f"{msg} [statement: {stmt}]"
+        logger.warning(f"[SQL_ERROR_IN_TRANSACTION] upload_id={self.upload_id} {self.pending_error}")
+
+    TX_STATE_QUERIES = (
+        "SELECT @@TRANCOUNT, XACT_STATE(), CURRENT_TRANSACTION_ID()",
+        "SELECT @@TRANCOUNT, XACT_STATE(), (SELECT transaction_id FROM sys.dm_tran_current_transaction)",
+        "SELECT @@TRANCOUNT, XACT_STATE(), NULL",
+    )
+
+    def _read_state(self, cursor):
+        """Return (trancount, xact_state, transaction_id) or None if unreadable."""
+        self._checking = True
+        try:
+            for i, q in enumerate(self.TX_STATE_QUERIES):
+                if i < getattr(self, "_query_idx", 0):
+                    continue
+                try:
+                    cursor.execute(q)
+                    row = cursor.fetchone()
+                    self._query_idx = i
+                    return row[0], row[1], row[2]
+                except Exception:
+                    continue
+            return None
+        finally:
+            self._checking = False
+
+    def _before(self, conn, cursor, statement, parameters, context, executemany) -> None:
+        if self._checking:
+            return
+        if self.in_flight is not None and self.pending_error is None:
+            # previous statement never completed -> it raised
+            self.pending_error = f"statement failed: {self.in_flight[:200]}"
+        if self.pending_error is not None:
+            self._verify(cursor)
+        elif self.writes_seen and getattr(self, "tx_id", None) is None and not getattr(self, "_tx_id_unavailable", False):
+            # Remember which SQL Server transaction holds our writes.
+            state = self._read_state(cursor)
+            if state is None or state[2] is None:
+                self._tx_id_unavailable = True
+            else:
+                self.tx_id = state[2]
+        self.in_flight = statement
+
+    def _after(self, conn, cursor, statement, parameters, context, executemany) -> None:
+        if self._checking:
+            return
+        self.in_flight = None
+        if statement.lstrip().lower().startswith(self.WRITE_PREFIXES):
+            self.writes_seen = True
+
+    def _transaction_lost(self, state) -> bool:
+        trancount, xact_state, tx_id = state
+        if xact_state == -1:
+            return True
+        if not self.writes_seen:
+            return False
+        if int(trancount or 0) == 0:
+            return True
+        known = getattr(self, "tx_id", None)
+        # The ODBC driver silently opens a NEW transaction after SQL Server rolls
+        # one back, so @@TRANCOUNT alone can look healthy. A changed id cannot.
+        return known is not None and tx_id is not None and tx_id != known
+
+    def _verify(self, cursor) -> None:
+        err = self.pending_error
+        self.pending_error = None
+        self.in_flight = None
+        state = self._read_state(cursor)
+        if state is None:
+            logger.warning("[TRANSACTION_GUARD] Could not read transaction state after a SQL error.")
+            return
+        if self._transaction_lost(state):
+            raise RuntimeError(
+                "SQL Server rolled back the migration transaction after a database error, so rows "
+                "written before it were discarded. The migration was stopped to avoid partial data. "
+                f"Original error: {err}"
+            )
+
+    def check_before_commit(self) -> None:
+        if self.pending_error is None and self.in_flight is not None:
+            self.pending_error = f"statement failed: {self.in_flight[:200]}"
+        if self.pending_error is None and not self.writes_seen:
+            return
+        raw = self.connection.connection.cursor()
+        try:
+            err = self.pending_error or "transaction changed during migration"
+            self.pending_error = None
+            self.in_flight = None
+            state = self._read_state(raw)
+            if state is not None and self._transaction_lost(state):
+                raise RuntimeError(
+                    "SQL Server transaction was rolled back or replaced during the migration; part of the "
+                    f"data would have been lost. Migration stopped and rolled back. Last error: {err}"
+                )
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
 
 
 class TransactionManager:
@@ -97,7 +254,17 @@ class TransactionManager:
             # - Commits ONLY after the block exits successfully.
             # - Rolls back automatically if any exception is raised.
             with engine.begin() as connection:
-                response = execution_fn(connection)
+                guard = None
+                if getattr(getattr(connection, "dialect", None), "name", "") == "mssql":
+                    guard = SqlServerTransactionGuard(connection, upload_id)
+                    guard.attach()
+                try:
+                    response = execution_fn(connection)
+                    if guard is not None:
+                        guard.check_before_commit()
+                finally:
+                    if guard is not None:
+                        guard.detach()
 
             # Transaction has committed successfully!
             logger.info(f"[TRANSACTION] Transaction committed successfully for uploadId={upload_id}")

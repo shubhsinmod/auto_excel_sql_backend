@@ -1,18 +1,28 @@
 """
 Customer-only duplicate detection and migration for dbo.Customer.
 
-Rules:
-- Name and mobile both present: reuse only when both normalized values match.
-- Name present and mobile different: insert a separate customer.
-- Name empty and mobile present: match by normalized mobile.
-- Name present and mobile empty: match only a customer with the same name and empty mobile.
-- Name and mobile both empty: skip the customer row.
+Duplicate rules (implemented once in ``CustomerIdentityIndex`` and shared by the
+preview, the dry-run counts and the real migration):
+
+| Condition                                   | Action                                   |
+|---------------------------------------------|------------------------------------------|
+| Customer Name + Mobile Number both match    | Duplicate; reuse existing Customer_ID    |
+| Same name, different mobile                 | Insert a new customer                    |
+| Different name, same mobile                 | Insert a new customer (both must match)  |
+| Same name, both mobiles empty               | Duplicate; reuse existing Customer_ID    |
+| Name empty, mobile present                  | Match by mobile; reuse if found          |
+| Name empty, mobile not found                | Insert a new customer                    |
+| Name and mobile both empty                  | Do not insert a customer (row skipped)   |
+
+- Names compare trimmed and case-insensitively; mobiles compare by their digits.
 - Missing Customer_Name is stored as an empty string, never the literal string 'null'.
+- An existing customer is never overwritten by the migration.
 - Foreign-key ID propagation remains available to related tables; other tables do not
   perform duplicate detection through this module.
 """
 
 from __future__ import annotations
+from app.migration.outlet_matcher import OutletCache
 from datetime import datetime, date
 import math
 import re
@@ -30,7 +40,7 @@ from app.models.migration import (
 )
 from app.migration.id_resolver import IdResolverStore
 from app.migration.lookup_resolver import DynamicLookupResolver, LookupRelationship
-from app.migration.engine import sanitize_value
+from app.migration.engine import sanitize_value, coerce_value_for_column
 from app.core.logging import logger
 
 
@@ -160,6 +170,157 @@ def normalized_column_name(name: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(name or "").casefold())
 
 
+_MOBILE_COLUMN_PRIORITY = (
+    "mobilenumber", "mobile", "customermobile", "mobileno", "phonenumber",
+    "customerphone", "phone", "contactnumber",
+)
+_MOBILE_COLUMN_KEYWORDS = (
+    "mobile_number", "mobile", "phone_number", "customer_phone",
+    "customer_mobile", "contact_number", "phone"
+)
+
+
+def detect_customer_mobile_column(t_meta: TableMetadata, mapped_db_columns: Optional[Set[str]] = None) -> str:
+    """
+    Pick the Customer column that stores the mobile number.
+
+    A column mapped from the source file wins (so the duplicate check reads the same
+    column the file writes); otherwise Mobile_Number-like names are preferred over
+    generic Contact_Number/Phone columns. Previously the first keyword hit in table
+    order was used, which selected Contact_Number on dbo.Customer even though the
+    file's phone column is mapped to Mobile_Number, so existing customers were
+    looked up in the wrong column.
+    """
+    candidates = [
+        c.name for c in t_meta.columns
+        if any(k in c.name.lower() for k in _MOBILE_COLUMN_KEYWORDS)
+    ]
+    if not candidates:
+        return "Mobile_Number"
+
+    def rank(col: str) -> int:
+        norm = normalized_column_name(col)
+        return _MOBILE_COLUMN_PRIORITY.index(norm) if norm in _MOBILE_COLUMN_PRIORITY else len(_MOBILE_COLUMN_PRIORITY)
+
+    mapped = [c for c in candidates if mapped_db_columns and c in mapped_db_columns]
+    pool = mapped or candidates
+    return sorted(pool, key=lambda c: (rank(c), candidates.index(c)))[0]
+
+
+class CustomerRuleConflictError(RuntimeError):
+    """Raised when a Customer row cannot be stored without breaking the duplicate rules."""
+
+
+class CustomerIdentityIndex:
+    """
+    Single source of truth for the Customer duplicate rules (used by preview,
+    dry-run counts and the real migration so they can never disagree):
+
+    | Incoming row                     | Matches                                      |
+    |----------------------------------|----------------------------------------------|
+    | name + mobile                    | customer with the SAME name AND SAME mobile  |
+    | name, mobile empty               | customer with the same name and EMPTY mobile |
+    | name empty, mobile               | any customer with that mobile                |
+    | name empty, mobile empty         | nothing - the row is skipped                 |
+
+    A name with a different mobile, or a different name with the same mobile,
+    is a new customer. Entries are opaque objects (DB records or pending inserts);
+    the first entry registered for a key wins, so existing DB rows (registered
+    first, ordered by primary key) take precedence over new rows.
+    """
+
+    def __init__(self) -> None:
+        self.by_pair: Dict[Tuple[str, str], Any] = {}
+        self.by_name_without_mobile: Dict[str, Any] = {}
+        self.by_mobile: Dict[str, Any] = {}
+
+    @staticmethod
+    def classify(norm_name: str, norm_mobile: str) -> str:
+        if not norm_name and not norm_mobile:
+            return "EMPTY_IDENTITY"
+        if norm_name and norm_mobile:
+            return "NAME_AND_MOBILE"
+        if norm_name:
+            return "NAME_ONLY"
+        return "MOBILE_ONLY"
+
+    def match(self, norm_name: str, norm_mobile: str) -> Any:
+        kind = self.classify(norm_name, norm_mobile)
+        if kind == "NAME_AND_MOBILE":
+            return self.by_pair.get((norm_name, norm_mobile))
+        if kind == "NAME_ONLY":
+            return self.by_name_without_mobile.get(norm_name)
+        if kind == "MOBILE_ONLY":
+            # Prefer the exact identity (blank name + same mobile), else any
+            # customer that owns this mobile number.
+            exact = self.by_pair.get(("", norm_mobile))
+            return exact if exact is not None else self.by_mobile.get(norm_mobile)
+        return None
+
+    def add(self, norm_name: str, norm_mobile: str, entry: Any) -> None:
+        if norm_mobile:
+            self.by_pair.setdefault((norm_name, norm_mobile), entry)
+            self.by_mobile.setdefault(norm_mobile, entry)
+        elif norm_name:
+            self.by_name_without_mobile.setdefault(norm_name, entry)
+
+    def replace(self, old_entry: Any, new_entry: Any) -> None:
+        """Swap a pending placeholder for the real record after insert."""
+        for mapping in (self.by_pair, self.by_name_without_mobile, self.by_mobile):
+            for key, value in list(mapping.items()):
+                if value is old_entry:
+                    mapping[key] = new_entry
+
+
+def customer_row_matches(
+    incoming_name: Any, incoming_mobile: Any, existing_name: Any, existing_mobile: Any
+) -> bool:
+    """True when an existing customer is a duplicate of the incoming row under the rules."""
+    index = CustomerIdentityIndex()
+    marker = object()
+    index.add(normalize_name(existing_name), normalize_mobile(existing_mobile), marker)
+    return index.match(normalize_name(incoming_name), normalize_mobile(incoming_mobile)) is marker
+
+
+def _find_rule_matching_customer(
+    conn: Connection,
+    dialect_name: str,
+    table_name: str,
+    pk_col: str,
+    name_col: str,
+    mobile_col: str,
+    incoming_name: Any,
+    incoming_mobile: Any,
+) -> Any:
+    """Look up an existing customer that is a rule-level duplicate of the incoming row."""
+    quoted_tbl = quote_identifier(table_name, dialect_name)
+    q_pk = quote_identifier(pk_col, dialect_name)
+    q_nm = quote_identifier(name_col, dialect_name)
+    q_mob = quote_identifier(mobile_col, dialect_name)
+    n_mobile = normalize_mobile(incoming_mobile)
+    if n_mobile:
+        raw_mobile = str(incoming_mobile).strip()
+        candidates = {raw_mobile, n_mobile}
+        ph = [f":m_{k}" for k in range(len(candidates))]
+        params = {f"m_{k}": v for k, v in enumerate(sorted(candidates))}
+        sql = f"SELECT {q_pk}, {q_nm}, {q_mob} FROM {quoted_tbl} WHERE {q_mob} IN ({', '.join(ph)}) ORDER BY {q_pk} ASC"
+    else:
+        params = {"n_val": str(incoming_name or "").strip().lower()}
+        sql = (
+            f"SELECT {q_pk}, {q_nm}, {q_mob} FROM {quoted_tbl} "
+            f"WHERE LOWER(LTRIM(RTRIM({q_nm}))) = :n_val ORDER BY {q_pk} ASC"
+        )
+    for row in conn.execute(text(sql), params).fetchall():
+        if customer_row_matches(incoming_name, incoming_mobile, row[1], row[2]):
+            return row[0]
+    return None
+
+
+def _is_unique_violation(err: Exception) -> bool:
+    err_str = str(err).lower()
+    return any(k in err_str for k in ("2627", "2601", "duplicate key", "unique constraint", "unique", "duplicate"))
+
+
 def execute_customer_insert(
     conn: Connection,
     dialect_name: str,
@@ -167,126 +328,88 @@ def execute_customer_insert(
     param_dict: Dict[str, Any],
     pk_col: str,
     t_meta: TableMetadata,
-    source_row_num: int = 1
-) -> Any:
-    """Executes a parameterized INSERT for Customer and captures the generated identity."""
+    source_row_num: int = 1,
+    name_col: Optional[str] = None,
+    mobile_col: Optional[str] = None,
+) -> Tuple[Any, bool]:
+    """
+    Executes a parameterized INSERT for Customer and captures the generated identity.
+
+    Returns ``(customer_id, reused_existing)``.
+
+    On a unique-key violation the existing record is reused ONLY when it is a
+    rule-level duplicate (same name+mobile, same name with no mobile, or same
+    mobile when the incoming name is empty). An existing record is never
+    overwritten. If no rule-level duplicate exists, the database schema itself
+    prevents storing a customer that the rules call "new" (for example a UNIQUE
+    constraint on Mobile_Number while two different names share one mobile);
+    this raises ``CustomerRuleConflictError`` so the transaction is rolled back
+    and the row is reported instead of silently linking orders to another person.
+    """
     col_meta_map = {c.name: c for c in t_meta.columns}
     sanitize_customer_param_dict(param_dict, t_meta, table_name, col_meta_map)
+
+    name_col = name_col or next((c.name for c in t_meta.columns if c.name.lower() in ("customer_name", "customername", "name")), "Customer_Name")
+    mobile_col = mobile_col or next(
+        (c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number"
+    )
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
     quoted_pk = quote_identifier(pk_col, dialect_name)
     insert_cols = [c for c in param_dict.keys() if c in col_meta_map]
     quoted_cols = [quote_identifier(c, dialect_name) for c in insert_cols]
     val_params = [f":{c}" for c in insert_cols]
+    params = {c: _to_native_py(param_dict[c]) for c in insert_cols}
 
-    if dialect_name == "mssql":
-        try:
-            insert_stmt = text(
-                f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-                f"OUTPUT INSERTED.{quoted_pk} "
-                f"VALUES ({', '.join(val_params)})"
-            )
-            res = conn.execute(insert_stmt, param_dict)
-            return res.scalar(), False
-        except Exception as trigger_err:
-            err_str = str(trigger_err).lower()
-            if "trigger" in err_str or "output clause without into" in err_str:
-                fallback_stmt = text(
+    try:
+        if dialect_name == "mssql":
+            try:
+                res = conn.execute(text(
+                    f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
+                    f"OUTPUT INSERTED.{quoted_pk} "
+                    f"VALUES ({', '.join(val_params)})"
+                ), params)
+                return res.scalar(), False
+            except Exception as trigger_err:
+                err_str = str(trigger_err).lower()
+                if "trigger" not in err_str and "output clause without into" not in err_str:
+                    raise
+                res = conn.execute(text(
                     f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
                     f"VALUES ({', '.join(val_params)});\n"
                     f"SELECT SCOPE_IDENTITY();"
-                )
-                try:
-                    res = conn.execute(fallback_stmt, param_dict)
-                    return res.scalar(), False
-                except Exception as fb_err:
-                    trigger_err = fb_err
-                    err_str = str(fb_err).lower()
-
-            if "2627" in err_str or "2601" in err_str or "duplicate key" in err_str or "primary key" in err_str or "unique constraint" in err_str:
-                logger.warning(
-                    f"[CUSTOMER_OVERRIDE_ON_DUPLICATE] Duplicate customer key on insert ({trigger_err}); overriding existing record."
-                )
-                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
-                name_col = next((c.name for c in t_meta.columns if "name" in c.name.lower()), "Customer_Name")
-                existing_cid = param_dict.get(pk_col)
-                if existing_cid is None and param_dict.get(mob_col):
-                    q_mob = quote_identifier(mob_col, dialect_name)
-                    existing_cid = conn.execute(
-                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {q_mob} = :m_val"),
-                        {"m_val": str(param_dict[mob_col]).strip()}
-                    ).scalar()
-                elif existing_cid is None and param_dict.get(name_col):
-                    q_nm = quote_identifier(name_col, dialect_name)
-                    existing_cid = conn.execute(
-                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {q_nm} = :n_val"),
-                        {"n_val": str(param_dict[name_col]).strip()}
-                    ).scalar()
-
-                if existing_cid is not None:
-                    upd_cols = [c for c in insert_cols if c != pk_col]
-                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
-                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
-                    upd_params = dict(param_dict)
-                    upd_params["_override_cid"] = existing_cid
-                    conn.execute(upd_stmt, upd_params)
-                    return existing_cid, True
-            raise trigger_err
-    elif dialect_name in ("postgresql", "postgres"):
-        try:
-            insert_stmt = text(
+                ), params)
+                return res.scalar(), False
+        if dialect_name in ("postgresql", "postgres"):
+            res = conn.execute(text(
                 f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-                f"VALUES ({', '.join(val_params)}) "
-                f"RETURNING {quoted_pk}"
-            )
-            res = conn.execute(insert_stmt, param_dict)
+                f"VALUES ({', '.join(val_params)}) RETURNING {quoted_pk}"
+            ), params)
             return res.scalar(), False
-        except Exception as pg_err:
-            err_str = str(pg_err).lower()
-            if "unique" in err_str or "duplicate" in err_str:
-                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
-                existing_cid = param_dict.get(pk_col)
-                if existing_cid is None and param_dict.get(mob_col):
-                    existing_cid = conn.execute(
-                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {quote_identifier(mob_col, dialect_name)} = :m_val"),
-                        {"m_val": str(param_dict[mob_col]).strip()}
-                    ).scalar()
-                if existing_cid is not None:
-                    upd_cols = [c for c in insert_cols if c != pk_col]
-                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
-                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
-                    upd_params = dict(param_dict)
-                    upd_params["_override_cid"] = existing_cid
-                    conn.execute(upd_stmt, upd_params)
-                    return existing_cid, True
-            raise pg_err
-    else:  # sqlite and generic
-        try:
-            insert_stmt = text(
-                f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) "
-                f"VALUES ({', '.join(val_params)})"
+        res = conn.execute(text(
+            f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES ({', '.join(val_params)})"
+        ), params)
+        return getattr(res, "lastrowid", None) or param_dict.get(pk_col), False
+    except Exception as insert_err:
+        if not _is_unique_violation(insert_err):
+            raise
+        existing_cid = _find_rule_matching_customer(
+            conn, dialect_name, table_name, pk_col, name_col, mobile_col,
+            param_dict.get(name_col), param_dict.get(mobile_col),
+        )
+        if existing_cid is not None:
+            logger.warning(
+                "[CUSTOMER_REUSED_ON_UNIQUE_CONFLICT] source_row=%s Customer_ID=%s (existing record kept unchanged)",
+                source_row_num, existing_cid,
             )
-            res = conn.execute(insert_stmt, param_dict)
-            return getattr(res, "lastrowid", None) or param_dict.get(pk_col), False
-        except Exception as sql_err:
-            err_str = str(sql_err).lower()
-            if "unique" in err_str or "duplicate" in err_str:
-                mob_col = next((c.name for c in t_meta.columns if "mob" in c.name.lower() or "phone" in c.name.lower()), "Mobile_Number")
-                existing_cid = param_dict.get(pk_col)
-                if existing_cid is None and param_dict.get(mob_col):
-                    existing_cid = conn.execute(
-                        text(f"SELECT {quoted_pk} FROM {quoted_tbl} WHERE {quote_identifier(mob_col, dialect_name)} = :m_val"),
-                        {"m_val": str(param_dict[mob_col]).strip()}
-                    ).scalar()
-                if existing_cid is not None:
-                    upd_cols = [c for c in insert_cols if c != pk_col]
-                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
-                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
-                    upd_params = dict(param_dict)
-                    upd_params["_override_cid"] = existing_cid
-                    conn.execute(upd_stmt, upd_params)
-                    return existing_cid, True
-            raise sql_err
+            return existing_cid, True
+        raise CustomerRuleConflictError(
+            f"Source row {source_row_num}: Customer (name={param_dict.get(name_col)!r}, "
+            f"mobile={param_dict.get(mobile_col)!r}) is a NEW customer under the duplicate rules, "
+            f"but table '{table_name}' rejected the insert with a unique-key violation and no existing "
+            f"customer matches the rules. Check unique constraints on '{table_name}' "
+            f"(e.g. on {mobile_col}). Database error: {insert_err}"
+        ) from insert_err
 
 
 def resolve_customer(
@@ -297,8 +420,8 @@ def resolve_customer(
     dialect_name: Optional[str] = None
 ) -> Tuple[Optional[int], str]:
     """
-    Resolve/insert a single customer row. Returns (Customer_ID, action).
-    action can be: 'SKIPPED', 'REUSED', 'UPDATED_NAME', 'INSERTED'.
+    Resolve/insert a single customer row using the same rules as the migration.
+    Returns (Customer_ID, action) where action is 'SKIPPED', 'REUSED' or 'INSERTED'.
     """
     if dialect_name is None:
         try:
@@ -311,82 +434,45 @@ def resolve_customer(
     n_name = normalize_name(raw_name)
     n_mobile = normalize_mobile(raw_mobile)
 
-    # Rule 3: Both empty -> Skip
     if not n_name and not n_mobile:
         logger.info("[CUSTOMER_SKIPPED_EMPTY_IDENTITY] Both customer name and mobile are empty; row skipped.")
         return None, "SKIPPED"
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
     lock_clause = "WITH (UPDLOCK, HOLDLOCK)" if dialect_name == "mssql" else ""
-
-    # Rule 1: Mobile number is present
     if n_mobile:
-        sql = f"""
-            SELECT Customer_ID, Customer_Name, Mobile_Number
-            FROM {quoted_tbl} {lock_clause}
-            WHERE Mobile_Number IS NOT NULL AND LTRIM(RTRIM(Mobile_Number)) <> ''
-            ORDER BY Customer_ID ASC
-        """
-        rows = conn.execute(text(sql)).mappings().all()
-        for row in rows:
-            if normalize_mobile(row["Mobile_Number"]) == n_mobile:
-                cid = row["Customer_ID"]
-                old_name = row["Customer_Name"]
-                if is_name_blank_or_null(old_name) and n_name:
-                    update_sql = f"UPDATE {quoted_tbl} SET Customer_Name = :name WHERE Customer_ID = :id"
-                    conn.execute(text(update_sql), {"name": raw_name, "id": cid})
-                    logger.info(f"[CUSTOMER_NAME_UPDATED] Customer_ID={cid} updated from {old_name!r} to {raw_name!r}")
-                    return cid, "UPDATED_NAME"
-                return cid, "REUSED"
+        where = "Mobile_Number IS NOT NULL AND LTRIM(RTRIM(Mobile_Number)) <> ''"
+    else:
+        where = "(Mobile_Number IS NULL OR LTRIM(RTRIM(Mobile_Number)) = '')"
+    rows = conn.execute(text(
+        f"SELECT Customer_ID, Customer_Name, Mobile_Number FROM {quoted_tbl} {lock_clause} "
+        f"WHERE {where} ORDER BY Customer_ID ASC"
+    )).mappings().all()
+    index = CustomerIdentityIndex()
+    for row in rows:
+        index.add(normalize_name(row["Customer_Name"]), normalize_mobile(row["Mobile_Number"]), row["Customer_ID"])
+    existing_id = index.match(n_name, n_mobile)
+    if existing_id is not None:
+        return existing_id, "REUSED"
 
-        # Not found with mobile -> Insert new customer
-        insert_name = raw_name if n_name else "null"
-        insert_mobile = raw_mobile or None
-        param_dict = {"Customer_Name": insert_name, "Mobile_Number": insert_mobile}
-        dummy_meta = TableMetadata(
-            name=table_name,
-            schema_name="dbo",
-            columns=[
-                ColumnMetadata(name="Customer_ID", type="INT", nullable=False, primary_key=True, identity=True),
-                ColumnMetadata(name="Customer_Name", type="VARCHAR(100)", nullable=False),
-                ColumnMetadata(name="Mobile_Number", type="VARCHAR(20)", nullable=True),
-            ],
-            primary_keys=["Customer_ID"]
-        )
-        insert_res = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
-        new_id = insert_res[0] if isinstance(insert_res, tuple) else insert_res
-        return new_id, "INSERTED"
-
-    # Rule 2: Mobile empty, customer name present
-    if n_name and not n_mobile:
-        sql = f"""
-            SELECT Customer_ID, Customer_Name, Mobile_Number
-            FROM {quoted_tbl} {lock_clause}
-            WHERE (Mobile_Number IS NULL OR LTRIM(RTRIM(Mobile_Number)) = '')
-            ORDER BY Customer_ID ASC
-        """
-        rows = conn.execute(text(sql)).mappings().all()
-        for row in rows:
-            if normalize_name(row["Customer_Name"]) == n_name:
-                return row["Customer_ID"], "REUSED"
-
-        # Not found -> Insert new name-only customer
-        param_dict = {"Customer_Name": raw_name, "Mobile_Number": None}
-        dummy_meta = TableMetadata(
-            name=table_name,
-            schema_name="dbo",
-            columns=[
-                ColumnMetadata(name="Customer_ID", type="INT", nullable=False, primary_key=True, identity=True),
-                ColumnMetadata(name="Customer_Name", type="VARCHAR(100)", nullable=False),
-                ColumnMetadata(name="Mobile_Number", type="VARCHAR(20)", nullable=True),
-            ],
-            primary_keys=["Customer_ID"]
-        )
-        insert_res = execute_customer_insert(conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta)
-        new_id = insert_res[0] if isinstance(insert_res, tuple) else insert_res
-        return new_id, "INSERTED"
-
-    return None, "SKIPPED"
+    # Legacy helper contract: an unnamed customer is stored with the literal 'null'.
+    insert_name = raw_name if n_name else "null"
+    param_dict = {"Customer_Name": insert_name, "Mobile_Number": raw_mobile or None}
+    dummy_meta = TableMetadata(
+        name=table_name,
+        schema_name="dbo",
+        columns=[
+            ColumnMetadata(name="Customer_ID", type="INT", nullable=False, primary_key=True, identity=True),
+            ColumnMetadata(name="Customer_Name", type="VARCHAR(100)", nullable=False),
+            ColumnMetadata(name="Mobile_Number", type="VARCHAR(20)", nullable=True),
+        ],
+        primary_keys=["Customer_ID"]
+    )
+    new_id, reused = execute_customer_insert(
+        conn, dialect_name, table_name, param_dict, "Customer_ID", dummy_meta,
+        name_col="Customer_Name", mobile_col="Mobile_Number",
+    )
+    return new_id, ("REUSED" if reused else "INSERTED")
 
 
 def process_customer_migration(
@@ -443,13 +529,16 @@ def process_customer_migration(
         (c.name for c in t_meta.columns if c.name.lower() in ("customer_name", "customername", "name")),
         "Customer_Name"
     )
-    customer_mobile_db_col = next(
-        (c.name for c in t_meta.columns if any(k in c.name.lower() for k in (
-            "mobile_number", "mobile", "phone_number", "customer_phone",
-            "customer_mobile", "contact_number", "phone"
-        ))),
-        "Mobile_Number"
+    customer_mobile_db_col = detect_customer_mobile_column(t_meta, set(db_to_excel.keys()))
+    # Earlier versions also wrote the mobile into the first phone-like column in table
+    # order (Contact_Number on dbo.Customer). Keep writing it there so stored values
+    # are unchanged; only the duplicate lookup moved to the mapped mobile column.
+    legacy_mobile_db_col = next(
+        (c.name for c in t_meta.columns if any(k in c.name.lower() for k in _MOBILE_COLUMN_KEYWORDS)),
+        None
     )
+    if legacy_mobile_db_col in (customer_mobile_db_col, customer_name_db_col) or legacy_mobile_db_col in db_to_excel:
+        legacy_mobile_db_col = None
 
     name_ex_col = db_to_excel.get(customer_name_db_col)
     if not name_ex_col:
@@ -627,17 +716,94 @@ def process_customer_migration(
             )
         pending_repeat_dates.clear()
 
-    # 2. In-memory customer tracking (Excel-scoped deduplication only; no DB pre-queries)
-    mobile_to_customer: Dict[str, Dict[str, Any]] = {}
-    name_to_customer: Dict[str, Dict[str, Any]] = {}
-    name_mobile_to_customer: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # 2. Customer identity index (single implementation of the duplicate rules)
+    identity_index = CustomerIdentityIndex()
     pending_repeat_dates: Dict[Any, Any] = {}
     pending_new_cust_repeat_dates: Dict[int, Any] = {}
-    pending_name_updates: Dict[Any, str] = {}
     pending_customers: List[Dict[str, Any]] = []
+    # Structured accounting (row-level, every source row lands in exactly one bucket)
+    rows_linked_existing: List[int] = []
+    rows_linked_new: List[int] = []
+    rows_skipped_empty: List[int] = []
+    rows_reused_on_conflict: List[int] = []
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
     file_id_col = next((c.name for c in t_meta.columns if c.name.lower() == "fileid"), None)
+
+    # Pre-load existing database customers that could be rule-level duplicates of
+    # this upload: every customer sharing a name with the file (for name+mobile and
+    # name-only rows) and every customer sharing a mobile (for mobile-only rows).
+    # A failure here MUST stop the migration: continuing would insert duplicates of
+    # every existing customer and the run would still look successful.
+    select_cols = [
+        c.name for c in t_meta.columns
+        if not any(b in str(c.type).upper() for b in ("BINARY", "IMAGE", "VARBINARY", "GEOGRAPHY", "GEOMETRY"))
+    ]
+    for required_col in (pk_col, customer_name_db_col, customer_mobile_db_col):
+        if required_col in col_meta_map and required_col not in select_cols:
+            select_cols.append(required_col)
+    quoted_select_cols = [quote_identifier(c, dialect_name) for c in select_cols]
+    lock_clause = "WITH (UPDLOCK, HOLDLOCK)" if dialect_name == "mssql" else ""
+    order_clause = f"ORDER BY {quote_identifier(pk_col, dialect_name)} ASC"
+
+    distinct_mobile_keys: Set[str] = set()
+    distinct_name_keys: Set[str] = set()
+    for r_rec in df_records:
+        rm = get_df_val(r_rec, mobile_ex_col)
+        rn = get_df_val(r_rec, name_ex_col)
+        nm = normalize_mobile(rm)
+        nn = normalize_name(rn)
+        if nm:
+            distinct_mobile_keys.add(nm)
+            distinct_mobile_keys.add(str(rm).strip())
+        if nn:
+            # Compared with LOWER(LTRIM(RTRIM(name))) so the lookup does not depend
+            # on the database collation or on stray spaces in the source file.
+            distinct_name_keys.add(str(rn).strip().lower())
+
+    existing_by_id: Dict[Any, Dict[str, Any]] = {}
+    q_mob = quote_identifier(customer_mobile_db_col, dialect_name)
+    q_nm = quote_identifier(customer_name_db_col, dialect_name)
+    PARAM_CHUNK = 800  # stays far below SQL Server's 2,100 parameter limit
+    try:
+        for keys, where_expr, prefix in (
+            (sorted(distinct_mobile_keys), q_mob, "m"),
+            (sorted(distinct_name_keys), f"LOWER(LTRIM(RTRIM({q_nm})))", "n"),
+        ):
+            for c_idx in range(0, len(keys), PARAM_CHUNK):
+                chunk = keys[c_idx:c_idx + PARAM_CHUNK]
+                ph = [f":{prefix}_{k}" for k in range(len(chunk))]
+                p_chunk = {f"{prefix}_{k}": val for k, val in enumerate(chunk)}
+                sel_sql = (
+                    f"SELECT {', '.join(quoted_select_cols)} FROM {quoted_tbl} {lock_clause} "
+                    f"WHERE {where_expr} IN ({', '.join(ph)}) {order_clause}"
+                )
+                for r in conn.execute(text(sel_sql), p_chunk).mappings().all():
+                    if r.get(pk_col) is not None:
+                        existing_by_id.setdefault(r.get(pk_col), dict(r))
+    except Exception as prefetch_err:
+        logger.error(f"[CUSTOMER_PREFETCH_FAILED] upload_id={upload_id}: {prefetch_err}")
+        raise RuntimeError(
+            f"Could not read existing customers from '{table_name}' to apply the duplicate rules; "
+            f"migration stopped to avoid inserting duplicate customers. Database error: {prefetch_err}"
+        ) from prefetch_err
+
+    def _sort_pk(v: Any) -> Tuple[int, Any]:
+        try:
+            return (0, int(v))
+        except (TypeError, ValueError):
+            return (1, str(v))
+
+    for db_id in sorted(existing_by_id.keys(), key=_sort_pk):
+        r_dict = existing_by_id[db_id]
+        raw_db_name = r_dict.get(customer_name_db_col)
+        raw_db_mobile = r_dict.get(customer_mobile_db_col)
+        entry = {"id": db_id, "name": raw_db_name, "mobile": raw_db_mobile, "record": r_dict}
+        identity_index.add(normalize_name(raw_db_name), normalize_mobile(raw_db_mobile), entry)
+    logger.info(
+        "[CUSTOMER_PREFETCH] upload_id=%s existing_candidates=%s distinct_file_names=%s distinct_file_mobiles=%s",
+        upload_id, len(existing_by_id), len(distinct_name_keys), len({normalize_mobile(m) for m in distinct_mobile_keys}),
+    )
 
     # Discover foreign keys constrained on Customer (e.g. Outlet_ID)
     fk_injections: Dict[str, Tuple[str, str]] = {
@@ -650,7 +816,17 @@ def process_customer_migration(
             if rel.child_column not in fk_injections:
                 fk_injections[rel.child_column] = (rel.parent_table, rel.parent_id_column)
 
-    # 3. Pass 1: High-speed in-memory classification and deduplication
+    def _register_existing_row(target_id: Any, orig_idx: int, norm_name: str, norm_mobile: str, raw_mobile: Any) -> None:
+        id_store.register_row_id(table_name, int(orig_idx), target_id)
+        if norm_mobile:
+            id_store.register_id(table_name, norm_mobile, target_id)
+            if raw_mobile:
+                id_store.register_id(table_name, str(raw_mobile).strip(), target_id)
+        if norm_name:
+            id_store.register_id(table_name, norm_name, target_id)
+        id_store.register_composite_key(table_name, (norm_name, norm_mobile), target_id)
+
+    # 3. Pass 1: in-memory classification against DB customers + earlier rows of this file
     num_rows = len(df_records)
     for i in range(num_rows):
         orig_idx = df_indices[i]
@@ -662,175 +838,86 @@ def process_customer_migration(
         norm_name = normalize_name(raw_name)
         norm_mobile = normalize_mobile(raw_mobile)
 
-        # -------------------------------------------------------------
-        # Rule 3: Both customer name and mobile number are empty -> Skip
-        # -------------------------------------------------------------
+        # Rule: name and mobile both empty -> do not insert a customer.
         if not norm_name and not norm_mobile:
             logger.debug(
                 "[CUSTOMER_SKIPPED_EMPTY_IDENTITY] upload_id=%s source_row=%s",
                 upload_id, source_row_num
             )
             t_stat.skipped += 1
+            rows_skipped_empty.append(source_row_num)
             continue
 
-        # -------------------------------------------------------------
-        # Rule 1: Mobile present -> mobile is the unique customer matching key.
-        # -------------------------------------------------------------
-        if norm_mobile:
-            customer_match = mobile_to_customer.get(norm_mobile)
-            if customer_match is not None:
-                if "id" in customer_match:
-                    target_id = customer_match["id"]
-                    existing_name = customer_match.get("name")
-                    if is_name_blank_or_null(existing_name) and norm_name:
-                        pending_name_updates[target_id] = str(raw_name).strip()
-                        customer_match["name"] = str(raw_name).strip()
-                        record = customer_match.get("record")
-                        if isinstance(record, dict):
-                            record[customer_name_db_col] = str(raw_name).strip()
-
-                    update_repeat_visit_date(target_id, row)
-                    id_store.register_row_id(table_name, int(orig_idx), target_id)
-                    id_store.register_id(table_name, norm_mobile, target_id)
-                    if raw_mobile:
-                        id_store.register_id(table_name, str(raw_mobile).strip(), target_id)
-                    resolved_name = normalize_name(customer_match.get("name")) or norm_name
-                    if resolved_name:
-                        id_store.register_id(table_name, resolved_name, target_id)
-                    id_store.register_composite_key(table_name, (norm_name, norm_mobile), target_id)
-                    t_stat.reused += 1
-                else:
-                    p_idx = customer_match["pending_index"]
-                    p_cust = pending_customers[p_idx]
-                    p_cust["row_indices"].append(int(orig_idx))
-                    if is_name_blank_or_null(p_cust["insert_name"]) and norm_name:
-                        p_cust["insert_name"] = str(raw_name).strip()
-                        p_cust["param_dict"][customer_name_db_col] = str(raw_name).strip()
-                        p_cust["norm_name"] = norm_name
-                    update_pending_repeat_visit_date(p_idx, row)
-                    t_stat.reused += 1
+        customer_match = identity_index.match(norm_name, norm_mobile)
+        if customer_match is not None:
+            if "id" in customer_match:
+                target_id = customer_match["id"]
+                update_repeat_visit_date(target_id, row)
+                _register_existing_row(target_id, orig_idx, norm_name, norm_mobile, raw_mobile)
+                rows_linked_existing.append(source_row_num)
             else:
-                # No existing customer uses this mobile; create pending new customer
-                insert_name = str(raw_name).strip() if norm_name else ""
-                insert_mobile = str(raw_mobile).strip() if raw_mobile is not None and not is_name_blank_or_null(raw_mobile) else norm_mobile
-
-                param_dict = _build_customer_param_dict(
-                    row=row,
-                    table_name=table_name,
-                    t_meta=t_meta,
-                    col_meta_map=col_meta_map,
-                    excel_to_db=excel_to_db,
-                    db_to_excel=db_to_excel,
-                    customer_name_db_col=customer_name_db_col,
-                    customer_mobile_db_col=customer_mobile_db_col,
-                    insert_name=insert_name,
-                    insert_mobile=insert_mobile,
-                    fk_injections=fk_injections,
-                    lookup_relationships=lookup_relationships,
-                    parent_records_by_table=parent_records_by_table,
-                    val_items_by_col=val_items_by_col,
-                    value_transform_lookup=value_transform_lookup,
-                    col_value_transform=col_value_transform,
-                    user_val_overrides=user_val_overrides,
-                    fk_resolution_cache=fk_resolution_cache,
-                    upload_id=upload_id,
-                    source_row_num=source_row_num,
-                    get_df_val=get_df_val,
-                    unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache,
-                    file_id=file_id,
-                    file_id_col=file_id_col
-                )
-
-                set_insert_visit_dates(param_dict, row)
-                p_idx = len(pending_customers)
-                p_cust = {
-                    "pending_id": p_idx,
-                    "norm_mobile": norm_mobile,
-                    "raw_mobile": raw_mobile,
-                    "norm_name": norm_name,
-                    "raw_name": raw_name,
-                    "insert_name": insert_name,
-                    "insert_mobile": insert_mobile,
-                    "param_dict": param_dict,
-                    "source_row_num": source_row_num,
-                    "primary_row_idx": int(orig_idx),
-                    "row_indices": [int(orig_idx)]
-                }
-                pending_customers.append(p_cust)
-                mobile_to_customer[norm_mobile] = {"pending_index": p_idx}
-                if norm_name:
-                    name_mobile_to_customer[(norm_name, norm_mobile)] = {"pending_index": p_idx}
-
-        # -------------------------------------------------------------
-        # Rule 2: Mobile is empty, but customer name is present
-        # -------------------------------------------------------------
+                p_idx = customer_match["pending_index"]
+                pending_customers[p_idx]["row_indices"].append(int(orig_idx))
+                update_pending_repeat_visit_date(p_idx, row)
+                rows_linked_new.append(source_row_num)
+            t_stat.reused += 1
         else:
-            name_match = name_to_customer.get(norm_name)
-            if name_match is not None:
-                if "id" in name_match:
-                    target_id = name_match["id"]
-                    update_repeat_visit_date(target_id, row)
-                    id_store.register_row_id(table_name, int(orig_idx), target_id)
-                    id_store.register_id(table_name, norm_name, target_id)
-                    id_store.register_composite_key(table_name, (norm_name, ""), target_id)
-                    t_stat.reused += 1
-                else:
-                    p_idx = name_match["pending_index"]
-                    p_cust = pending_customers[p_idx]
-                    p_cust["row_indices"].append(int(orig_idx))
-                    update_pending_repeat_visit_date(p_idx, row)
-                    t_stat.reused += 1
+            # New customer: name+mobile pair not seen, name-only not seen, or mobile not seen.
+            insert_name = str(raw_name).strip() if norm_name else ""
+            if norm_mobile:
+                insert_mobile = str(raw_mobile).strip() if raw_mobile is not None and not is_name_blank_or_null(raw_mobile) else norm_mobile
             else:
-                # Insert new name-only customer
-                insert_name = str(raw_name).strip()
                 insert_mobile = None
 
-                param_dict = _build_customer_param_dict(
-                    row=row,
-                    table_name=table_name,
-                    t_meta=t_meta,
-                    col_meta_map=col_meta_map,
-                    excel_to_db=excel_to_db,
-                    db_to_excel=db_to_excel,
-                    customer_name_db_col=customer_name_db_col,
-                    customer_mobile_db_col=customer_mobile_db_col,
-                    insert_name=insert_name,
-                    insert_mobile=insert_mobile,
-                    fk_injections=fk_injections,
-                    lookup_relationships=lookup_relationships,
-                    parent_records_by_table=parent_records_by_table,
-                    val_items_by_col=val_items_by_col,
-                    value_transform_lookup=value_transform_lookup,
-                    col_value_transform=col_value_transform,
-                    user_val_overrides=user_val_overrides,
-                    fk_resolution_cache=fk_resolution_cache,
-                    upload_id=upload_id,
-                    source_row_num=source_row_num,
-                    get_df_val=get_df_val,
-                    unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache,
-                    file_id=file_id,
-                    file_id_col=file_id_col
-                )
+            param_dict = _build_customer_param_dict(
+                row=row,
+                table_name=table_name,
+                t_meta=t_meta,
+                col_meta_map=col_meta_map,
+                excel_to_db=excel_to_db,
+                db_to_excel=db_to_excel,
+                customer_name_db_col=customer_name_db_col,
+                customer_mobile_db_col=customer_mobile_db_col,
+                insert_name=insert_name,
+                insert_mobile=insert_mobile,
+                fk_injections=fk_injections,
+                lookup_relationships=lookup_relationships,
+                parent_records_by_table=parent_records_by_table,
+                val_items_by_col=val_items_by_col,
+                value_transform_lookup=value_transform_lookup,
+                col_value_transform=col_value_transform,
+                user_val_overrides=user_val_overrides,
+                fk_resolution_cache=fk_resolution_cache,
+                upload_id=upload_id,
+                source_row_num=source_row_num,
+                get_df_val=get_df_val,
+                unmapped_empty_cols=unmapped_empty_cols,
+                outlet_id_cache=outlet_id_cache,
+                file_id=file_id,
+                file_id_col=file_id_col
+            )
 
-                set_insert_visit_dates(param_dict, row)
-                p_idx = len(pending_customers)
-                p_cust = {
-                    "pending_id": p_idx,
-                    "norm_mobile": "",
-                    "raw_mobile": None,
-                    "norm_name": norm_name,
-                    "raw_name": raw_name,
-                    "insert_name": insert_name,
-                    "insert_mobile": insert_mobile,
-                    "param_dict": param_dict,
-                    "source_row_num": source_row_num,
-                    "primary_row_idx": int(orig_idx),
-                    "row_indices": [int(orig_idx)]
-                }
-                pending_customers.append(p_cust)
-                name_to_customer[norm_name] = {"pending_index": p_idx}
+            if legacy_mobile_db_col:
+                param_dict[legacy_mobile_db_col] = insert_mobile
+            set_insert_visit_dates(param_dict, row)
+            p_idx = len(pending_customers)
+            placeholder = {"pending_index": p_idx}
+            pending_customers.append({
+                "pending_id": p_idx,
+                "placeholder": placeholder,
+                "norm_mobile": norm_mobile,
+                "raw_mobile": raw_mobile if norm_mobile else None,
+                "norm_name": norm_name,
+                "raw_name": raw_name,
+                "insert_name": insert_name,
+                "insert_mobile": insert_mobile,
+                "param_dict": param_dict,
+                "source_row_num": source_row_num,
+                "primary_row_idx": int(orig_idx),
+                "row_indices": [int(orig_idx)]
+            })
+            identity_index.add(norm_name, norm_mobile, placeholder)
+            rows_linked_new.append(source_row_num)
 
         # Periodic progress callback
         if progress_callback and (i % 500 == 0 or i == num_rows - 1):
@@ -845,44 +932,59 @@ def process_customer_migration(
             )
 
     # -------------------------------------------------------------
-    # Pass 2: High-Performance Multi-Row Batch INSERT for New Customers
+    # Pass 2: Multi-row batch INSERT for new customers
     # -------------------------------------------------------------
-    def _register_inserted_customer(new_id: Any, p_cust: Dict[str, Any], was_updated: bool = False) -> None:
+    def _register_inserted_customer(new_id: Any, p_cust: Dict[str, Any], reused_existing: bool = False) -> None:
+        if new_id is None:
+            raise RuntimeError(
+                f"Customer insert for source row {p_cust['source_row_num']} did not return a Customer_ID; "
+                f"related orders cannot be linked."
+            )
         if isinstance(new_id, float) and new_id.is_integer():
             new_id = int(new_id)
         elif str(new_id).endswith(".0"):
             new_id = int(float(new_id))
 
-        generated_ids_by_table[table_name].append(new_id)
-        source_row_indices_with_insert.add(p_cust["primary_row_idx"])
         for idx in p_cust["row_indices"]:
             id_store.register_row_id(table_name, idx, new_id)
-
         if p_cust["norm_mobile"]:
             id_store.register_id(table_name, p_cust["norm_mobile"], new_id)
             if p_cust["raw_mobile"]:
                 id_store.register_id(table_name, str(p_cust["raw_mobile"]).strip(), new_id)
-            if p_cust["norm_name"]:
-                id_store.register_id(table_name, p_cust["norm_name"], new_id)
-            id_store.register_composite_key(table_name, (p_cust["norm_name"], p_cust["norm_mobile"]), new_id)
-            cust_rec = {"id": new_id, "name": p_cust["insert_name"], "mobile": p_cust["insert_mobile"], "record": p_cust["param_dict"]}
-            mobile_to_customer[p_cust["norm_mobile"]] = cust_rec
-            if p_cust["norm_name"]:
-                name_mobile_to_customer[(p_cust["norm_name"], p_cust["norm_mobile"])] = cust_rec
-        else:
-            if p_cust["norm_name"]:
-                id_store.register_id(table_name, p_cust["norm_name"], new_id)
-                id_store.register_composite_key(table_name, (p_cust["norm_name"], ""), new_id)
-                cust_rec = {"id": new_id, "name": p_cust["insert_name"], "mobile": None, "record": p_cust["param_dict"]}
-                name_to_customer[p_cust["norm_name"]] = cust_rec
+        if p_cust["norm_name"]:
+            id_store.register_id(table_name, p_cust["norm_name"], new_id)
+        id_store.register_composite_key(table_name, (p_cust["norm_name"], p_cust["norm_mobile"]), new_id)
+        identity_index.replace(
+            p_cust["placeholder"],
+            {"id": new_id, "name": p_cust["insert_name"], "mobile": p_cust["insert_mobile"], "record": p_cust["param_dict"]},
+        )
 
         if p_cust["pending_id"] in pending_new_cust_repeat_dates:
             pending_repeat_dates[new_id] = pending_new_cust_repeat_dates[p_cust["pending_id"]]
 
-        if was_updated:
-            t_stat.updated += 1
+        if reused_existing:
+            # Existing rule-level duplicate found by the database (not in prefetch);
+            # it is linked, never overwritten, and is not counted as an insert.
+            t_stat.reused += 1
+            rows_reused_on_conflict.append(p_cust["source_row_num"])
         else:
+            generated_ids_by_table[table_name].append(new_id)
+            source_row_indices_with_insert.add(p_cust["primary_row_idx"])
             t_stat.inserted += 1
+
+    def _insert_single(p_cust: Dict[str, Any]) -> None:
+        new_id, reused = execute_customer_insert(
+            conn=conn,
+            dialect_name=dialect_name,
+            table_name=table_name,
+            param_dict=p_cust["param_dict"],
+            pk_col=pk_col,
+            t_meta=t_meta,
+            source_row_num=p_cust["source_row_num"],
+            name_col=customer_name_db_col,
+            mobile_col=customer_mobile_db_col,
+        )
+        _register_inserted_customer(new_id, p_cust, reused_existing=reused)
 
     if pending_customers:
         for p_cust in pending_customers:
@@ -905,18 +1007,7 @@ def process_customer_migration(
                 if not subchunk:
                     return
                 if len(subchunk) == 1:
-                    p_cust = subchunk[0]
-                    res_val = execute_customer_insert(
-                        conn=conn,
-                        dialect_name=dialect_name,
-                        table_name=table_name,
-                        param_dict=p_cust["param_dict"],
-                        pk_col=pk_col,
-                        t_meta=t_meta,
-                        source_row_num=p_cust["source_row_num"]
-                    )
-                    new_id, was_upd = res_val if isinstance(res_val, tuple) else (res_val, False)
-                    _register_inserted_customer(new_id, p_cust, was_updated=was_upd)
+                    _insert_single(subchunk[0])
                     return
 
                 val_clauses = []
@@ -926,7 +1017,7 @@ def process_customer_migration(
                     for c in cols:
                         param_name = f"{c}_{r_idx}"
                         row_placeholders.append(f":{param_name}")
-                        batch_params[param_name] = _to_native_py(p_cust["param_dict"].get(c))
+                        batch_params[param_name] = coerce_value_for_column(_to_native_py(p_cust["param_dict"].get(c)), col_meta_map.get(c))
                     val_clauses.append(f"({', '.join(row_placeholders)})")
 
                 if dialect_name == "mssql":
@@ -942,109 +1033,54 @@ def process_customer_migration(
 
                 if sql:
                     try:
-                        res = conn.execute(text(sql), batch_params)
-                        fetched_rows = res.fetchall()
-                        if len(fetched_rows) == len(subchunk):
-                            for r_fetch, p_cust in zip(fetched_rows, subchunk):
-                                new_id = r_fetch[0]
-                                _register_inserted_customer(new_id, p_cust)
-                            return
+                        fetched_rows = conn.execute(text(sql), batch_params).fetchall()
                     except Exception as batch_err:
-                        err_msg = str(batch_err).lower()
-                        is_dup_err = ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg)
-                        if is_dup_err and len(subchunk) > 1:
-                            try:
-                                # High-performance batch duplicate resolution:
-                                # Look up all matching mobile/name records in SQL Server in 1 single batch query
-                                q_mob = quote_identifier(customer_mobile_db_col, dialect_name)
-                                q_nm = quote_identifier(customer_name_db_col, dialect_name)
-                                mob_map = {p["norm_mobile"]: p for p in subchunk if p.get("norm_mobile")}
-                                name_map = {p["norm_name"]: p for p in subchunk if not p.get("norm_mobile") and p.get("norm_name")}
-
-                                existing_matches: Dict[int, Any] = {}
-
-                                if mob_map:
-                                    m_items = list(mob_map.keys())
-                                    ph_m = [f":m_{k}" for k in range(len(m_items))]
-                                    p_m = {f"m_{k}": m for k, m in enumerate(m_items)}
-                                    sel_m_sql = f"SELECT {quoted_pk}, {q_mob} FROM {quoted_tbl} WHERE {q_mob} IN ({', '.join(ph_m)})"
-                                    m_res = conn.execute(text(sel_m_sql), p_m).fetchall()
-                                    for row_m in m_res:
-                                        found_cid = row_m[0]
-                                        found_mob = normalize_mobile(row_m[1])
-                                        if found_mob in mob_map:
-                                            p_match = mob_map[found_mob]
-                                            existing_matches[p_match["pending_id"]] = found_cid
-
-                                if name_map:
-                                    n_items = list(name_map.keys())
-                                    ph_n = [f":n_{k}" for k in range(len(n_items))]
-                                    p_n = {f"n_{k}": n for k, n in enumerate(n_items)}
-                                    sel_n_sql = f"SELECT {quoted_pk}, {q_nm} FROM {quoted_tbl} WHERE ({q_mob} IS NULL OR LTRIM(RTRIM(CAST({q_mob} AS NVARCHAR(MAX)))) = '') AND {q_nm} IN ({', '.join(ph_n)})"
-                                    n_res = conn.execute(text(sel_n_sql), p_n).fetchall()
-                                    for row_n in n_res:
-                                        found_cid = row_n[0]
-                                        found_nm = normalize_name(row_n[1])
-                                        if found_nm in name_map:
-                                            p_match = name_map[found_nm]
-                                            existing_matches[p_match["pending_id"]] = found_cid
-
-                                existing_sub = []
-                                new_sub = []
-                                for p_c in subchunk:
-                                    if p_c["pending_id"] in existing_matches:
-                                        existing_sub.append((p_c, existing_matches[p_c["pending_id"]]))
-                                    else:
-                                        new_sub.append(p_c)
-
-                                if existing_sub:
-                                    upd_cols = [c for c in cols if c != pk_col]
-                                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
-                                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
-                                    batch_upd_params = []
-                                    for p_c, exist_id in existing_sub:
-                                        _register_inserted_customer(exist_id, p_c, was_updated=True)
-                                        u_p = {c: _to_native_py(p_c["param_dict"].get(c)) for c in upd_cols}
-                                        u_p["_override_cid"] = exist_id
-                                        batch_upd_params.append(u_p)
-
-                                    if batch_upd_params:
-                                        conn.execute(upd_stmt, batch_upd_params)
-
-                                if new_sub:
-                                    if len(new_sub) < len(subchunk):
-                                        _insert_cust_subchunk(new_sub)
-                                    else:
-                                        mid = len(subchunk) // 2
-                                        _insert_cust_subchunk(subchunk[:mid])
-                                        _insert_cust_subchunk(subchunk[mid:])
-                                return
-                            except Exception as res_batch_err:
-                                logger.debug(f"[CUSTOMER_BATCH_DUP_FALLBACK] {res_batch_err}")
-                                mid = len(subchunk) // 2
-                                _insert_cust_subchunk(subchunk[:mid])
-                                _insert_cust_subchunk(subchunk[mid:])
-                                return
-
-                        # Fallback bisection for non-duplicate errors
-                        if len(subchunk) > 1 and is_dup_err:
-                            mid = len(subchunk) // 2
-                            _insert_cust_subchunk(subchunk[:mid])
-                            _insert_cust_subchunk(subchunk[mid:])
-                            return
+                        if not _is_unique_violation(batch_err):
+                            raise
+                        # The whole multi-row statement failed atomically: bisect so
+                        # the conflicting row(s) are handled individually (reuse an
+                        # exact rule match, otherwise fail loudly - never overwrite).
+                        logger.warning(f"[CUSTOMER_BATCH_FALLBACK] {batch_err}")
+                        mid = len(subchunk) // 2
+                        _insert_cust_subchunk(subchunk[:mid])
+                        _insert_cust_subchunk(subchunk[mid:])
+                        return
+                    if len(fetched_rows) != len(subchunk):
+                        raise RuntimeError(
+                            f"Customer batch insert returned {len(fetched_rows)} IDs for {len(subchunk)} rows "
+                            f"(source rows {[p['source_row_num'] for p in subchunk][:20]}); cannot link orders safely."
+                        )
+                    # SQL Server does not guarantee OUTPUT order for multi-row VALUES;
+                    # SQLite/Postgres RETURNING follow VALUES order in practice. Map IDs
+                    # back by reading the key columns of the inserted rows.
+                    if dialect_name == "mssql":
+                        id_list = [r[0] for r in fetched_rows]
+                        ph = [f":vid_{k}" for k in range(len(id_list))]
+                        back = conn.execute(
+                            text(
+                                f"SELECT {quoted_pk}, {q_nm}, {q_mob} FROM {quoted_tbl} "
+                                f"WHERE {quoted_pk} IN ({', '.join(ph)})"
+                            ),
+                            {f"vid_{k}": _to_native_py(v) for k, v in enumerate(id_list)},
+                        ).fetchall()
+                        by_identity: Dict[Tuple[str, str], List[Any]] = {}
+                        for b in sorted(back, key=lambda x: _sort_pk(x[0])):
+                            by_identity.setdefault((normalize_name(b[1]), normalize_mobile(b[2])), []).append(b[0])
+                        for p_cust in subchunk:
+                            ids = by_identity.get((p_cust["norm_name"], p_cust["norm_mobile"])) or []
+                            if not ids:
+                                raise RuntimeError(
+                                    f"Inserted customer for source row {p_cust['source_row_num']} could not be "
+                                    f"located after insert; cannot link orders safely."
+                                )
+                            _register_inserted_customer(ids.pop(0), p_cust)
+                    else:
+                        for r_fetch, p_cust in zip(fetched_rows, subchunk):
+                            _register_inserted_customer(r_fetch[0], p_cust)
+                    return
 
                 for p_cust in subchunk:
-                    res_val = execute_customer_insert(
-                        conn=conn,
-                        dialect_name=dialect_name,
-                        table_name=table_name,
-                        param_dict=p_cust["param_dict"],
-                        pk_col=pk_col,
-                        t_meta=t_meta,
-                        source_row_num=p_cust["source_row_num"]
-                    )
-                    new_id, was_upd = res_val if isinstance(res_val, tuple) else (res_val, False)
-                    _register_inserted_customer(new_id, p_cust, was_updated=was_upd)
+                    _insert_single(p_cust)
 
             for chunk_start in range(0, len(cust_chunk_list), CHUNK_SIZE):
                 chunk = cust_chunk_list[chunk_start : chunk_start + CHUNK_SIZE]
@@ -1062,28 +1098,27 @@ def process_customer_migration(
                     )
 
     # -------------------------------------------------------------
-    # Pass 3: Flush Pending Name Updates & Batched Repeat Visit Dates
+    # Pass 3: Batched repeat-visit dates
     # -------------------------------------------------------------
-    if pending_name_updates:
-        quoted_name_col = quote_identifier(customer_name_db_col, dialect_name)
-        quoted_pk_local = quote_identifier(pk_col, dialect_name)
-        upd_stmt = text(
-            f"UPDATE {quoted_tbl} SET {quoted_name_col} = :customer_name "
-            f"WHERE {quoted_pk_local} = :customer_id"
-        )
-        upd_params = [
-            {"customer_name": name, "customer_id": cid}
-            for cid, name in pending_name_updates.items()
-        ]
-        conn.execute(upd_stmt, upd_params)
-        logger.info("[CUSTOMER_NAME_BATCH_UPDATED] count=%s", len(upd_params))
-
     flush_repeat_visit_dates()
 
+    # Structured, row-level reconciliation. Every source row must be in exactly one bucket.
+    accounted = len(rows_linked_existing) + len(rows_linked_new) + len(rows_skipped_empty)
+    if accounted != num_rows:
+        raise RuntimeError(
+            f"Customer accounting mismatch for upload {upload_id}: {num_rows} source rows but only "
+            f"{accounted} classified (existing={len(rows_linked_existing)}, new={len(rows_linked_new)}, "
+            f"skipped={len(rows_skipped_empty)})."
+        )
     logger.info(
-        f"[CUSTOMER_MIGRATION] Finished '{table_name}': "
-        f"inserted={t_stat.inserted}, reused={t_stat.reused}, "
-        f"updated={t_stat.updated}, skipped={t_stat.skipped}"
+        "[CUSTOMER_RECONCILIATION] table=%s upload_id=%s source_rows=%s | "
+        "distinct_new_customers_inserted=%s | rows_linked_to_new_customers=%s | "
+        "rows_linked_to_existing_db_customers=%s | rows_reused_after_unique_conflict=%s | "
+        "rows_skipped_name_and_mobile_empty=%s (expected business rule) | failures=%s | "
+        "sample_skipped_rows=%s",
+        table_name, upload_id, num_rows, t_stat.inserted, len(rows_linked_new),
+        len(rows_linked_existing), len(rows_reused_on_conflict), len(rows_skipped_empty),
+        t_stat.failed, rows_skipped_empty[:20],
     )
     return {
         "inserted": t_stat.inserted,
@@ -1151,19 +1186,19 @@ def _build_customer_param_dict(
         if fk_col in param_dict and param_dict[fk_col] is not None:
             continue
         if str(parent_tbl or "").strip().lower().split(".")[-1] == "outlets":
-            from app.migration.lookup_resolver import get_single_outlet_id
-            cached_outlet_id = outlet_id_cache.get(parent_tbl) if outlet_id_cache else None
-            if cached_outlet_id is None:
-                cached_outlet_id = get_single_outlet_id(parent_records_by_table, parent_tbl, parent_col)
-                if outlet_id_cache is not None:
-                    outlet_id_cache[parent_tbl] = cached_outlet_id
-            outlet_col_meta = col_meta_map.get(fk_col)
-            param_dict[fk_col] = sanitize_value(
-                cached_outlet_id,
-                getattr(outlet_col_meta, "type", ""),
-                getattr(outlet_col_meta, "nullable", False)
-            )
-            continue
+            if "outlet_cache" not in fk_resolution_cache:
+                o_recs = parent_records_by_table.get(parent_tbl) or parent_records_by_table.get(f"dbo.{parent_tbl}") or []
+                fk_resolution_cache["outlet_cache"] = OutletCache(o_recs)
+            o_cache = fk_resolution_cache["outlet_cache"]
+            rel_o = next((r for r in lookup_relationships if r.child_table == table_name and r.child_column == fk_col), None)
+            src_o = get_df_val(row, rel_o.excel_name_column) if (rel_o and rel_o.excel_name_column) else None
+            oid = o_cache.find_outlet_id(src_o) if src_o else None
+            if oid is None:
+                oid = o_cache.resolve_row_outlet_id(row if isinstance(row, dict) else row.to_dict())
+            if oid is not None:
+                param_dict[fk_col] = int(oid)
+                continue
+
         db_recs = parent_records_by_table.get(parent_tbl, [])
         rel = next((r for r in lookup_relationships if r.child_table == table_name and r.child_column == fk_col), None)
         src_name = get_df_val(row, rel.excel_name_column) if (rel and rel.excel_name_column) else None
@@ -1229,15 +1264,8 @@ def preview_customer_counts(
         (c.name for c in t_meta.columns if c.name.lower() in ("customer_name", "customername", "name")),
         "Customer_Name"
     )
-    customer_mobile_db_col = next(
-        (c.name for c in t_meta.columns if any(k in c.name.lower() for k in (
-            "mobile_number", "mobile", "phone_number", "customer_phone",
-            "customer_mobile", "contact_number", "phone"
-        ))),
-        "Mobile_Number"
-    )
-
     db_to_excel = {m.database_column: m.excel_column for m in mappings if m.excel_column in df.columns}
+    customer_mobile_db_col = detect_customer_mobile_column(t_meta, set(db_to_excel.keys()))
     name_ex_col = db_to_excel.get(customer_name_db_col)
     mobile_ex_col = db_to_excel.get(customer_mobile_db_col)
 
@@ -1267,9 +1295,24 @@ def preview_customer_counts(
             return row_dict[actual_col]
         return None
 
-    known_mobiles: Set[str] = set()
-    known_names_no_mobile: Set[str] = set()
-    known_name_mobile_pairs: Set[Tuple[str, str]] = set()
+    # Same rule implementation as the real migration, seeded with existing DB customers.
+    index = CustomerIdentityIndex()
+    pk_name = next((c.name for c in t_meta.columns if c.primary_key), None)
+    existing_sorted = list(existing_records or [])
+    if pk_name:
+        def _pk_key(rec: Dict[str, Any]) -> Tuple[int, Any]:
+            v = rec.get(pk_name)
+            try:
+                return (0, int(v))
+            except (TypeError, ValueError):
+                return (1, str(v))
+        existing_sorted.sort(key=_pk_key)
+    for rec in existing_sorted:
+        index.add(
+            normalize_name(rec.get(customer_name_db_col)),
+            normalize_mobile(rec.get(customer_mobile_db_col)),
+            "existing",
+        )
 
     ins_cnt = 0
     skip_cnt = 0
@@ -1277,33 +1320,15 @@ def preview_customer_counts(
 
     df_records = df.to_dict(orient="records")
     for row in df_records:
-        raw_n = get_df_val(row, name_ex_col)
-        raw_m = get_df_val(row, mobile_ex_col)
-        n_n = normalize_name(raw_n)
-        n_m = normalize_mobile(raw_m)
-
-        # Rule 3: Both empty -> Skip
+        n_n = normalize_name(get_df_val(row, name_ex_col))
+        n_m = normalize_mobile(get_df_val(row, mobile_ex_col))
         if not n_n and not n_m:
             skip_cnt += 1
             continue
-
-        # Both present -> match only the name+mobile pair. Empty name + mobile
-        # -> match by mobile alone.
-        if n_m:
-            if (n_n and (n_n, n_m) in known_name_mobile_pairs) or (not n_n and n_m in known_mobiles):
-                reus_cnt += 1
-            else:
-                ins_cnt += 1
-                known_mobiles.add(n_m)
-                if n_n:
-                    known_name_mobile_pairs.add((n_n, n_m))
-
-        # Rule 2: Mobile empty, name present
+        if index.match(n_n, n_m) is not None:
+            reus_cnt += 1
         else:
-            if n_n in known_names_no_mobile:
-                reus_cnt += 1
-            else:
-                ins_cnt += 1
-                known_names_no_mobile.add(n_n)
+            ins_cnt += 1
+            index.add(n_n, n_m, "new")
 
     return ins_cnt, skip_cnt, reus_cnt

@@ -1,4 +1,6 @@
 import re
+import difflib
+import unicodedata
 from typing import List, Dict, Any, Optional, Tuple
 from app.utils.normalization import normalize_cell_value, normalize_string
 from app.models.migration import ResolvedEntityRecord
@@ -105,9 +107,56 @@ def outlet_row_source_values(row_data: Dict[str, Any]) -> Tuple[Optional[str], O
             continue
         if normalized_key in ("restaurantname", "restaurant", "outletname"):
             restaurant_value = clean_value
-        elif normalized_key in ("virtualbrandname", "virtualbrand", "brandname"):
-            virtual_brand_value = clean_value
+        # virtual_brand_name is intentionally ignored: the outlet is identified by
+        # restaurant_name only (business decision). The second value is kept in the
+        # return signature for compatibility and is always None.
     return restaurant_value, virtual_brand_value
+
+
+def compact_outlet_key(value: Any) -> str:
+    """Lowercase letters/digits only: 'Namaste - Vijayanagar' == 'NAMASTE VIJAYANAGAR' == 'Namaste-Vijayanagar'."""
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", str(value)).casefold())
+
+
+def closest_outlet_names(source: str, db_records: List[Dict[str, Any]], name_col: str = "Outlet_Name", limit: int = 3) -> List[str]:
+    """Nearest database outlet names (for error messages only - never used to pick an ID)."""
+    names = [str(r.get(name_col) or "").strip() for r in db_records if str(r.get(name_col) or "").strip()]
+    key = compact_outlet_key(source)
+    by_key = {compact_outlet_key(n): n for n in names}
+    hits = difflib.get_close_matches(key, list(by_key.keys()), n=limit, cutoff=0.5)
+    return [by_key[h] for h in hits]
+
+
+def _unique_spelling_variant(branch: Optional[str], candidates: List["OutletMatchCandidate"]) -> Optional["OutletMatchCandidate"]:
+    """
+    Branch names are spelled differently in POS exports and the database
+    ('Vijayanagar' vs 'Vijay Nagar', 'Malleshwaram' vs 'Maleshwaram').
+    Accept a candidate only when it is clearly the same word:
+      - compact names (letters/digits only) of at least 5 characters,
+      - similarity >= 0.90 (about one letter different),
+      - exactly one candidate passes, and no other outlet is within 0.05 of it.
+    Otherwise return None so the row is reported instead of guessed.
+    """
+    key = compact_outlet_key(branch)
+    if len(key) < 5:
+        return None
+    scored = []
+    for c in candidates:
+        if c.id is None:
+            continue
+        best = 0.0
+        for name in (c.compact_name, compact_outlet_key(c.short_code), compact_outlet_key(c.locality)):
+            if len(name) >= 5:
+                best = max(best, difflib.SequenceMatcher(None, key, name).ratio())
+        scored.append((best, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored or scored[0][0] < 0.90:
+        return None
+    if len(scored) > 1 and scored[1][0] >= scored[0][0] - 0.05:
+        return None
+    return scored[0][1]
 
 
 def outlet_row_source_key(row_data: Dict[str, Any]) -> Tuple[str, str]:
@@ -125,6 +174,7 @@ class OutletMatchCandidate:
         self.id = record.get(id_col)
         self.raw_name = str(record.get(name_col) or "").strip()
         self.norm_name = normalize_cell_value(self.raw_name)
+        self.compact_name = compact_outlet_key(self.raw_name)
         self.base_name, self.locality = extract_outlet_base_name(self.raw_name)
         self.norm_base = normalize_cell_value(self.base_name)
         self.address = str(record.get("Address") or "").strip()
@@ -208,9 +258,11 @@ class OutletMatcher:
         candidates = [OutletMatchCandidate(r, id_col, name_col) for r in db_records]
 
         # Stage 1: Exact case-insensitive match on full raw name
+        compact_source = compact_outlet_key(raw_source)
         exact_matches = [
             c for c in candidates
             if c.raw_name.lower() == raw_source.lower() or c.norm_name == norm_source
+            or (compact_source and c.compact_name == compact_source)
         ]
         if len(exact_matches) == 1:
             m = exact_matches[0]
@@ -271,7 +323,44 @@ class OutletMatcher:
                     or (c.locality and normalize_cell_value(c.locality) == norm_loc)
                 )
             ]
+            if not suffix_matches:
+                # Compact compare: 'J P Nagar' == 'JP Nagar', 'Old-Madras Road' == 'OLD madras road'
+                compact_loc = compact_outlet_key(loc_source)
+                suffix_matches = [
+                    c for c in candidates
+                    if c.id is not None and compact_loc and compact_loc in (
+                        c.compact_name, compact_outlet_key(c.short_code), compact_outlet_key(c.locality)
+                    )
+                ]
+            fuzzy_suffix = False
+            if not suffix_matches:
+                fuzzy_hit = _unique_spelling_variant(loc_source, candidates)
+                if fuzzy_hit is not None:
+                    suffix_matches = [fuzzy_hit]
+                    fuzzy_suffix = True
             suffix_ids = {str(c.id) for c in suffix_matches}
+            if len(suffix_ids) == 1 and fuzzy_suffix:
+                m = suffix_matches[0]
+                logger.warning(
+                    "[OUTLET_SPELLING_VARIANT_MATCH] '%s' -> branch '%s' matched database outlet '%s' (ID=%s)",
+                    raw_source, loc_source, m.raw_name, m.id,
+                )
+                return {
+                    "status": "MATCHED",
+                    "outlet_id": m.id,
+                    "matched_outlet_name": m.raw_name,
+                    "source_value": raw_source,
+                    "normalized_name": norm_source,
+                    "normalized_base": norm_base_source,
+                    "detected_locality": loc_source,
+                    "match_type": "BRANCH_SUFFIX_SPELLING_VARIANT",
+                    "confidence": 0.95,
+                    "candidates": [{"id": m.id, "name": m.raw_name, "record": m.record}],
+                    "message": (
+                        f"Branch '{loc_source}' matched outlet '{m.raw_name}' (ID={m.id}) as a spelling variant "
+                        f"(only one close outlet name)."
+                    )
+                }
             if len(suffix_ids) == 1:
                 m = suffix_matches[0]
                 return {
@@ -346,9 +435,13 @@ class OutletMatcher:
         # Stage 3: Normalized base outlet name matching
         # Matches base name against database outlet names
         # E.g., Excel: "Namaste BTM" (base: "Namaste") vs Database: "Namaste"
+        norm_loc_source = compact_outlet_key(loc_source) if loc_source else ""
         base_matches = [
             c for c in candidates
-            if c.norm_name == norm_base_source or c.norm_base == norm_base_source
+            if (c.norm_name == norm_base_source or c.norm_base == norm_base_source)
+            # A different branch is never the same outlet: 'Namaste - Vijayanagar'
+            # must not resolve to 'Namaste BTM' just because both start with 'Namaste'.
+            and not (norm_loc_source and c.locality and compact_outlet_key(c.locality) != norm_loc_source)
         ]
 
         if len(base_matches) == 1:
@@ -440,7 +533,15 @@ class OutletMatcher:
             "match_type": "NO_MATCH",
             "confidence": 0.0,
             "candidates": [],
-            "message": f"No existing database outlet found matching '{raw_source}'."
+            "message": (
+                f"No existing database outlet found matching '{raw_source}' "
+                f"(compared case/space/punctuation-insensitively as '{compact_outlet_key(raw_source)}')."
+                + (
+                    f" Closest outlet names in database: {', '.join(repr(n) for n in closest_outlet_names(raw_source, db_records, name_col))}."
+                    if closest_outlet_names(raw_source, db_records, name_col) else
+                    f" Database has {len(db_records)} outlet(s); none is similar."
+                )
+            )
         }
 
     @classmethod
@@ -461,13 +562,15 @@ class OutletMatcher:
           - If they resolve to different database outlet IDs -> DIFFERENT_OUTLETS_DETECTED (Flagged for review).
         - Preserves original source values for traceability.
         """
-        if restaurant_col and virtual_brand_col:
+        if restaurant_col:
             r_val = row_data.get(restaurant_col)
-            v_val = row_data.get(virtual_brand_col)
             r_clean = str(r_val).strip() if r_val is not None else None
-            v_clean = str(v_val).strip() if v_val is not None else None
+            if r_clean and r_clean.lower() in ("nan", "none", "null", "nat"):
+                r_clean = None
         else:
-            r_clean, v_clean = outlet_row_source_values(row_data)
+            r_clean, _ = outlet_row_source_values(row_data)
+        # Outlet is identified by restaurant_name only; virtual_brand_name is ignored.
+        v_clean = None
 
         # Case A: Neither has value
         if not r_clean and not v_clean:
@@ -597,3 +700,130 @@ class OutletMatcher:
             "candidates": [],
             "message": f"Neither restaurant_name ('{r_clean}') nor virtual_brand_name ('{v_clean}') matched any database outlet."
         }
+
+
+class OutletCache:
+    """
+    High-performance in-memory cache of database outlets preloaded from dbo.Outlets.
+    Supports case-insensitive, whitespace-normalized, and punctuation-normalized lookup.
+    Handles single and multiple outlets cleanly.
+    """
+    def __init__(self, db_records: Optional[List[Dict[str, Any]]] = None):
+        self.records = db_records or []
+        self.exact_norm_map: Dict[str, Any] = {}
+        self.id_to_record: Dict[Any, Dict[str, Any]] = {}
+        self._build_index()
+
+    def _build_index(self) -> None:
+        for r in self.records:
+            o_id = r.get("Outlet_ID")
+            o_name = str(r.get("Outlet_Name") or "").strip()
+            if o_id is None or not o_name:
+                continue
+            self.id_to_record[o_id] = r
+            
+            # Exact normalized name (lowercase, whitespace collapsed)
+            norm = normalize_cell_value(o_name)
+            if norm:
+                self.exact_norm_map[norm] = o_id
+                self.exact_norm_map[norm.replace(" ", "")] = o_id
+            
+            raw_clean = o_name.lower().strip()
+            self.exact_norm_map[raw_clean] = o_id
+            compact = compact_outlet_key(o_name)
+            if compact:
+                self.exact_norm_map.setdefault(compact, o_id)
+            self.exact_norm_map[raw_clean.replace(" ", "")] = o_id
+
+            # Short code if present
+            s_code = str(r.get("Short_Code") or "").strip()
+            if s_code and s_code.lower() not in ("none", "null", "nan"):
+                self.exact_norm_map[normalize_cell_value(s_code)] = o_id
+                self.exact_norm_map[s_code.lower().strip()] = o_id
+                self.exact_norm_map[s_code.lower().replace(" ", "")] = o_id
+
+    def find_outlet_id(self, source_name: Optional[Any]) -> Optional[Any]:
+        """
+        Finds the Outlet_ID from an outlet name using normalized matching
+        (case-insensitive, spacing-collapsed, and suffix-tolerant).
+        """
+        if source_name is None:
+            return None
+        raw = str(source_name).strip()
+        if not raw or raw.lower() in ("nan", "none", "null", "nat"):
+            return None
+        
+        # 1. Exact normalized match (handles case-insensitive and spacing)
+        norm = normalize_cell_value(raw)
+        if norm in self.exact_norm_map:
+            return self.exact_norm_map[norm]
+        
+        # 2. Match without any spaces
+        norm_no_spaces = norm.replace(" ", "")
+        if norm_no_spaces in self.exact_norm_map:
+            return self.exact_norm_map[norm_no_spaces]
+
+        raw_lower_no_spaces = raw.lower().replace(" ", "").replace("_", "").replace("-", "")
+        if raw_lower_no_spaces in self.exact_norm_map:
+            return self.exact_norm_map[raw_lower_no_spaces]
+        compact = compact_outlet_key(raw)
+        if compact and compact in self.exact_norm_map:
+            return self.exact_norm_map[compact]
+
+        # 3. Strip common generic branch words ('layout', 'branch', 'outlet', 'store', 'restaurant')
+        clean_tokens = [t for t in norm.split() if t not in ('layout', 'branch', 'outlet', 'store', 'restaurant', 'cafe')]
+        clean_norm = " ".join(clean_tokens)
+        if clean_norm and clean_norm in self.exact_norm_map:
+            return self.exact_norm_map[clean_norm]
+        if clean_norm and clean_norm.replace(" ", "") in self.exact_norm_map:
+            return self.exact_norm_map[clean_norm.replace(" ", "")]
+
+        # 4. Check base name and locality extraction (e.g. "Namaste BTM" -> "BTM")
+        base, loc = extract_outlet_base_name(raw)
+        if loc:
+            norm_loc = normalize_cell_value(loc)
+            if norm_loc in self.exact_norm_map:
+                return self.exact_norm_map[norm_loc]
+            clean_loc = " ".join([t for t in norm_loc.split() if t not in ('layout', 'branch', 'outlet', 'store')])
+            if clean_loc in self.exact_norm_map:
+                return self.exact_norm_map[clean_loc]
+
+        if base:
+            norm_base = normalize_cell_value(base)
+            if norm_base in self.exact_norm_map:
+                return self.exact_norm_map[norm_base]
+            clean_base = " ".join([t for t in norm_base.split() if t not in ('layout', 'branch', 'outlet', 'store')])
+            if clean_base in self.exact_norm_map:
+                return self.exact_norm_map[clean_base]
+
+        # 5. Fallback to OutletMatcher.match_outlet_name
+        res = OutletMatcher.match_outlet_name(raw, self.records)
+        if res.get("status") == "MATCHED":
+            return res.get("outlet_id")
+
+        return None
+
+    def resolve_row_outlet_id(self, row_data: Dict[str, Any]) -> Optional[Any]:
+        """
+        Resolves Outlet_ID from row data containing restaurant_name, virtual_brand_name,
+        or outlet_name.
+        """
+        if not isinstance(row_data, dict):
+            return None
+        r_clean, v_clean = outlet_row_source_values(row_data)
+        
+        # Check restaurant_name first
+        if r_clean:
+            oid = self.find_outlet_id(r_clean)
+            if oid is not None:
+                return oid
+                
+
+        # Check any column with 'outlet' in its name
+        for k, v in row_data.items():
+            if "outlet" in str(k).lower() and v is not None:
+                oid = self.find_outlet_id(v)
+                if oid is not None:
+                    return oid
+
+        return None

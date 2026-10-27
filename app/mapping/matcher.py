@@ -984,13 +984,14 @@ class ColumnMatcher:
             # we allow mapping across active tables when validated.
             is_generic_multi_table_source = (
                 norm_source in ("date", "time", "datetime", "timestamp")
-                or (source_concept and source_concept.id in ("order_date", "invoice_number", "total_amount", "tax_amount", "quantity"))
+                or (source_concept and source_concept.id in ("order_date", "invoice_number", "total_amount", "tax_amount", "quantity", "order_type"))
                 or norm_source in (
                     "invoice no", "invoiceno", "bill no", "billno", "invoice number",
                     "total", "grand total", "net total", "total amount", "final amount",
                     "total tax", "totaltax", "tax amount", "tax",
                     "item quantity", "quantity", "qty", "item qty",
-                    "payment type", "payment mode", "settlement type"
+                    "payment type", "payment mode", "settlement type",
+                    "order type", "ordertype"
                 )
             )
 
