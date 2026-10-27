@@ -7,6 +7,7 @@ class ExcelAnalysisResponse(BaseModel):
     Metadata and sample data returned after analyzing an uploaded Excel file.
     """
     upload_id: str = Field(..., alias="uploadId")
+    file_id: Optional[int] = Field(None, alias="fileId")
     file_name: str = Field(..., alias="fileName")
     sheet_name: str = Field(..., alias="sheetName")
     available_sheets: List[str] = Field(default_factory=list, alias="availableSheets")

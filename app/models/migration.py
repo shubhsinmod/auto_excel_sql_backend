@@ -380,6 +380,7 @@ class TableMigrationStat(BaseModel):
 
 class MigrationExecutionResponse(BaseModel):
     upload_id: str = Field(..., alias="uploadId")
+    file_id: Optional[int] = Field(None, alias="fileId")
     status: str = Field("COMPLETED", alias="status")
     transaction: str = Field("COMMITTED", alias="transaction")
     transaction_status: Optional[str] = Field("COMMITTED", alias="transactionStatus")
@@ -460,6 +461,7 @@ class MigrationExecutionResponse(BaseModel):
 class MigrationJobStatus(BaseModel):
     job_id: str = Field(..., alias="jobId")
     upload_id: str = Field(..., alias="uploadId")
+    file_id: Optional[int] = Field(None, alias="fileId")
     status: str = Field("PENDING", alias="status")
     transaction_status: str = Field("NOT_EXECUTED", alias="transactionStatus")
     current_table: Optional[str] = Field(None, alias="currentTable")

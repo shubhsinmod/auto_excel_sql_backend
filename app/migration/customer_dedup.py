@@ -415,7 +415,8 @@ def process_customer_migration(
     progress_callback: Optional[Callable[[str, int, int, int, int, int, int], None]] = None,
     tbl_idx: int = 0,
     total_tables: int = 1,
-    outlet_id_cache: Optional[Dict[str, Any]] = None
+    outlet_id_cache: Optional[Dict[str, Any]] = None,
+    file_id: Optional[int] = None
 ) -> Dict[str, int]:
     """
     Executes customer deduplication, insertion, and ID mapping within the migration engine transaction.
@@ -636,6 +637,7 @@ def process_customer_migration(
     pending_customers: List[Dict[str, Any]] = []
 
     quoted_tbl = quote_identifier(table_name, dialect_name)
+    file_id_col = next((c.name for c in t_meta.columns if c.name.lower() == "fileid"), None)
 
     # Discover foreign keys constrained on Customer (e.g. Outlet_ID)
     fk_injections: Dict[str, Tuple[str, str]] = {
@@ -735,7 +737,9 @@ def process_customer_migration(
                     source_row_num=source_row_num,
                     get_df_val=get_df_val,
                     unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache
+                    outlet_id_cache=outlet_id_cache,
+                    file_id=file_id,
+                    file_id_col=file_id_col
                 )
 
                 set_insert_visit_dates(param_dict, row)
@@ -805,7 +809,9 @@ def process_customer_migration(
                     source_row_num=source_row_num,
                     get_df_val=get_df_val,
                     unmapped_empty_cols=unmapped_empty_cols,
-                    outlet_id_cache=outlet_id_cache
+                    outlet_id_cache=outlet_id_cache,
+                    file_id=file_id,
+                    file_id_col=file_id_col
                 )
 
                 set_insert_visit_dates(param_dict, row)
@@ -925,12 +931,9 @@ def process_customer_migration(
 
                 if dialect_name == "mssql":
                     sql = (
-                        f"SET NOCOUNT ON;\n"
-                        f"DECLARE @ins_cust TABLE (_cid BIGINT, _rn INT IDENTITY(1,1));\n"
                         f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)})\n"
-                        f"OUTPUT INSERTED.{quoted_pk} INTO @ins_cust (_cid)\n"
-                        f"VALUES {', '.join(val_clauses)};\n"
-                        f"SELECT _cid, _rn FROM @ins_cust ORDER BY _rn ASC;"
+                        f"OUTPUT INSERTED.{quoted_pk}\n"
+                        f"VALUES {', '.join(val_clauses)};"
                     )
                 elif dialect_name in ("postgresql", "postgres", "sqlite"):
                     sql = f"INSERT INTO {quoted_tbl} ({', '.join(quoted_cols)}) VALUES {', '.join(val_clauses)} RETURNING {quoted_pk}"
@@ -948,8 +951,83 @@ def process_customer_migration(
                             return
                     except Exception as batch_err:
                         err_msg = str(batch_err).lower()
-                        # If conflict/duplicate, bisect into halves so non-conflicting rows succeed in batch
-                        if len(subchunk) > 1 and ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg):
+                        is_dup_err = ("2627" in err_msg or "2601" in err_msg or "duplicate" in err_msg or "unique" in err_msg or "primary key" in err_msg)
+                        if is_dup_err and len(subchunk) > 1:
+                            try:
+                                # High-performance batch duplicate resolution:
+                                # Look up all matching mobile/name records in SQL Server in 1 single batch query
+                                q_mob = quote_identifier(customer_mobile_db_col, dialect_name)
+                                q_nm = quote_identifier(customer_name_db_col, dialect_name)
+                                mob_map = {p["norm_mobile"]: p for p in subchunk if p.get("norm_mobile")}
+                                name_map = {p["norm_name"]: p for p in subchunk if not p.get("norm_mobile") and p.get("norm_name")}
+
+                                existing_matches: Dict[int, Any] = {}
+
+                                if mob_map:
+                                    m_items = list(mob_map.keys())
+                                    ph_m = [f":m_{k}" for k in range(len(m_items))]
+                                    p_m = {f"m_{k}": m for k, m in enumerate(m_items)}
+                                    sel_m_sql = f"SELECT {quoted_pk}, {q_mob} FROM {quoted_tbl} WHERE {q_mob} IN ({', '.join(ph_m)})"
+                                    m_res = conn.execute(text(sel_m_sql), p_m).fetchall()
+                                    for row_m in m_res:
+                                        found_cid = row_m[0]
+                                        found_mob = normalize_mobile(row_m[1])
+                                        if found_mob in mob_map:
+                                            p_match = mob_map[found_mob]
+                                            existing_matches[p_match["pending_id"]] = found_cid
+
+                                if name_map:
+                                    n_items = list(name_map.keys())
+                                    ph_n = [f":n_{k}" for k in range(len(n_items))]
+                                    p_n = {f"n_{k}": n for k, n in enumerate(n_items)}
+                                    sel_n_sql = f"SELECT {quoted_pk}, {q_nm} FROM {quoted_tbl} WHERE ({q_mob} IS NULL OR LTRIM(RTRIM(CAST({q_mob} AS NVARCHAR(MAX)))) = '') AND {q_nm} IN ({', '.join(ph_n)})"
+                                    n_res = conn.execute(text(sel_n_sql), p_n).fetchall()
+                                    for row_n in n_res:
+                                        found_cid = row_n[0]
+                                        found_nm = normalize_name(row_n[1])
+                                        if found_nm in name_map:
+                                            p_match = name_map[found_nm]
+                                            existing_matches[p_match["pending_id"]] = found_cid
+
+                                existing_sub = []
+                                new_sub = []
+                                for p_c in subchunk:
+                                    if p_c["pending_id"] in existing_matches:
+                                        existing_sub.append((p_c, existing_matches[p_c["pending_id"]]))
+                                    else:
+                                        new_sub.append(p_c)
+
+                                if existing_sub:
+                                    upd_cols = [c for c in cols if c != pk_col]
+                                    quoted_upd = [f"{quote_identifier(c, dialect_name)} = :{c}" for c in upd_cols]
+                                    upd_stmt = text(f"UPDATE {quoted_tbl} SET {', '.join(quoted_upd)} WHERE {quoted_pk} = :_override_cid")
+                                    batch_upd_params = []
+                                    for p_c, exist_id in existing_sub:
+                                        _register_inserted_customer(exist_id, p_c, was_updated=True)
+                                        u_p = {c: _to_native_py(p_c["param_dict"].get(c)) for c in upd_cols}
+                                        u_p["_override_cid"] = exist_id
+                                        batch_upd_params.append(u_p)
+
+                                    if batch_upd_params:
+                                        conn.execute(upd_stmt, batch_upd_params)
+
+                                if new_sub:
+                                    if len(new_sub) < len(subchunk):
+                                        _insert_cust_subchunk(new_sub)
+                                    else:
+                                        mid = len(subchunk) // 2
+                                        _insert_cust_subchunk(subchunk[:mid])
+                                        _insert_cust_subchunk(subchunk[mid:])
+                                return
+                            except Exception as res_batch_err:
+                                logger.debug(f"[CUSTOMER_BATCH_DUP_FALLBACK] {res_batch_err}")
+                                mid = len(subchunk) // 2
+                                _insert_cust_subchunk(subchunk[:mid])
+                                _insert_cust_subchunk(subchunk[mid:])
+                                return
+
+                        # Fallback bisection for non-duplicate errors
+                        if len(subchunk) > 1 and is_dup_err:
                             mid = len(subchunk) // 2
                             _insert_cust_subchunk(subchunk[:mid])
                             _insert_cust_subchunk(subchunk[mid:])
@@ -1038,7 +1116,9 @@ def _build_customer_param_dict(
     source_row_num: int,
     get_df_val: Callable[[Dict[str, Any], Optional[str]], Any],
     unmapped_empty_cols: Optional[List[str]] = None,
-    outlet_id_cache: Optional[Dict[str, Any]] = None
+    outlet_id_cache: Optional[Dict[str, Any]] = None,
+    file_id: Optional[int] = None,
+    file_id_col: Optional[str] = None
 ) -> Dict[str, Any]:
     """Builds a complete parameter dictionary for Customer insertion."""
     param_dict: Dict[str, Any] = {
@@ -1128,6 +1208,9 @@ def _build_customer_param_dict(
         for _col in t_meta.columns:
             if should_fill_unmapped_text_column(_col, t_meta):
                 param_dict.setdefault(_col.name, "")
+
+    if file_id_col and file_id is not None:
+        param_dict[file_id_col] = file_id
 
     return param_dict
 

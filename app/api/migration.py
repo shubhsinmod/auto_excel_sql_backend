@@ -13,6 +13,24 @@ from app.core.logging import logger
 
 router = APIRouter(prefix="/api/migration", tags=["Migration"])
 
+@router.get("/history")
+def get_migration_history(limit: int = 200):
+    """
+    Returns aggregated migration history metrics and all tracked uploaded files.
+    """
+    from app.services.history_service import history_service
+    return history_service.get_history_summary(limit=limit)
+
+@router.get("/files")
+def list_uploaded_files(limit: int = 50):
+    """
+    Returns list of uploaded files and their migration status.
+    """
+    from app.services.history_service import history_service
+    return history_service.get_uploaded_files(limit=limit)
+
+
+
 
 @router.post("/values/{upload_id}", response_model=Step3ProcessingResponse)
 def update_value_mappings(upload_id: str, request: ValueOverridesRequest):
